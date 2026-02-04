@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ACFly 飞控日志分析器</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- 引入 uPlot CSS -->
+    <link rel="stylesheet" href="lib/uPlot.min.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>ACFly 飞控日志分析</h1>
+            <p>日志分析在本机进行，不上传服务器。</p>
+        </header>
+
+        <div id="drop-zone" class="drop-zone">
+            <p>拖拽 .aclog 文件到此处，或点击选择文件</p>
+            <input type="file" id="file-input" accept=".aclog" style="display: none;">
+        </div>
+
+        <div id="file-info" class="panel hidden">
+            <h2>日志信息</h2>
+            <div id="info-content"></div>
+        </div>
+
+        <div id="charts-container" class="hidden">
+            <!-- 图表将由 JS 动态生成 -->
+        </div>
+
+        <div id="loading" class="hidden">
+            <div class="progress-container">
+                <div class="progress-bar" id="progress-bar">0%</div>
+            </div>
+            <p id="loading-text">正在解析日志...</p>
+        </div>
+    </div>
+
+    <!-- 引入 uPlot JS -->
+    <script src="lib/uPlot.iife.min.js"></script>
+    <script src="lib/plotly-2.30.0.min.js"></script>
+    <script src="parser.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
