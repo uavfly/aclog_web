@@ -56,24 +56,85 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     };
 
-    // 1. 尝试 ip-api.com (HTTP, JSONP)
-    // 免费版仅支持 HTTP。在本地 file:// 协议下，加载 HTTP 脚本通常是允许的，且该服务返回正确的 MIME 类型，避免 ORB 拦截。
-    fetchJsonp('http://ip-api.com/json/?lang=zh-CN')
-        .then(data => {
-            if (data.status !== 'success') throw new Error('ip-api failed');
-            displayIp(data.query, [data.city, data.country].filter(Boolean).join(', '));
-        })
-        .catch(() => {
-            // 2. 备用: ipify (HTTPS, JSONP). 仅返回 IP
-            // ipify 会返回 text/javascript 类型，兼容性极好
-            return fetchJsonp('https://api.ipify.org?format=jsonp')
-                .then(data => {
+    // 智能选择 IP 获取策略
+    const runGeoIp = async () => {
+        const isHttps = window.location.protocol === 'https:';
+
+        if (isHttps) {
+            // --- 策略 A: HTTPS (线上部署) ---
+            // 此时必须使用 HTTPS 接口，避免 Mixed Content 错误。
+            
+            // 1. 首选 ipwho.is (HTTPS, CORS支持, 中文)
+            try {
+                const res = await fetch('https://ipwho.is/?lang=zh-CN');
+                if (res.ok) {
+                    const data = await res.json();
+                    if (data.success) {
+                        // 过滤 undefined，组合城市和国家
+                        const loc = [data.city, data.country].filter(Boolean).join(', ');
+                        displayIp(data.ip, loc);
+                        return;
+                    }
+                }
+            } catch (e) { /* ignore */ }
+
+            // 2. 尝试 Cloudflare Trace (相对路径，最快，但可能无城市信息)
+            try {
+                const res = await fetch('/cdn-cgi/trace');
+                if (res.ok) {
+                    const text = await res.text();
+                    const ip = text.match(/ip=([^\n]+)/)?.[1];
+                    const loc = text.match(/loc=([^\n]+)/)?.[1]; // 仅国家代码
+                    if (ip) {
+                        displayIp(ip, loc);
+                        // 如果成功获取 IP，不再强求更详细的城市信息，以减少跳变
+                        return;
+                    }
+                }
+            } catch (e) { /* ignore */ }
+
+            // 3. 尝试 DB-IP (HTTPS, CORS, 免费版含城市)
+            try {
+                const res = await fetch('https://api.db-ip.com/v2/free/self');
+                if (res.ok) {
+                    const data = await res.json();
+                    const loc = [data.city, data.countryName].filter(Boolean).join(', ');
+                    displayIp(data.ipAddress, loc);
+                    return;
+                }
+            } catch (e) { /* ignore */ }
+
+            // 4. 兜底: Ipify (HTTPS, 仅 IP)
+            try {
+                const res = await fetch('https://api.ipify.org?format=json');
+                if (res.ok) {
+                    const data = await res.json();
                     displayIp(data.ip, '');
-                });
-        })
-        .catch(err => {
-            console.warn('GeoIP lookup failed completely:', err);
-        });
+                }
+            } catch (e) { console.warn('All HTTPS GeoIP failed'); }
+
+        } else {
+            // --- 策略 B: 本地 file:// 或 HTTP 环境 ---
+            // 此时 Fetch 可能会被 CORS 拦截，使用 JSONP 更稳妥。
+            // 使用 http://ip-api.com，内容丰富且支持 JSONP
+            fetchJsonp('http://ip-api.com/json/?lang=zh-CN')
+                .then(data => {
+                    if (data.status === 'success') {
+                        displayIp(data.query, [data.city, data.country].filter(Boolean).join(', '));
+                    } else {
+                        throw new Error('ip-api Error');
+                    }
+                })
+                .catch(() => {
+                    // 备用: Ipify JSONP
+                    return fetchJsonp('https://api.ipify.org?format=jsonp')
+                        .then(data => displayIp(data.ip, ''));
+                })
+                .catch(e => console.warn('Local GeoIP failed:', e));
+        }
+    };
+
+    runGeoIp();
 
     // 拖拽事件处理
     dropZone.addEventListener('dragover', (e) => {
