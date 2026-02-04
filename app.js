@@ -6,6 +6,75 @@ document.addEventListener('DOMContentLoaded', () => {
     const chartsContainer = document.getElementById('charts-container');
     const loading = document.getElementById('loading');
 
+    // 尝试获取 IP 及地理位置
+    // 改用 JSONP 方式，以支持本地 file:// 协议运行时的跨域请求
+    const displayIp = (ip, loc) => {
+        const display = document.getElementById('cf-ip-display');
+        if (display && ip) {
+            // 避免重复显示
+            if (display.textContent.includes(ip)) return;
+            const locStr = loc ? ` - ${loc}` : '';
+            display.innerText = `您的 IP: ${ip}${locStr}`;
+            // 强制换行显示
+            display.style.display = 'block';
+            display.style.marginTop = '5px';
+            display.style.fontSize = '0.9em';
+            display.style.fontWeight = 'normal';
+        }
+    };
+
+    const fetchJsonp = (url, callbackParam = 'callback') => {
+        return new Promise((resolve, reject) => {
+            const cbName = 'jsonp_' + Math.floor(Math.random() * 1000000);
+            const script = document.createElement('script');
+            let timeoutId;
+
+            window[cbName] = (data) => {
+                cleanup();
+                resolve(data);
+            };
+
+            const cleanup = () => {
+                if (window[cbName]) delete window[cbName];
+                if (script.parentNode) script.parentNode.removeChild(script);
+                if (timeoutId) clearTimeout(timeoutId);
+            };
+
+            script.onerror = () => {
+                cleanup();
+                reject(new Error(`JSONP failed for ${url}`));
+            };
+
+            timeoutId = setTimeout(() => {
+                cleanup();
+                reject(new Error(`JSONP timeout for ${url}`));
+            }, 5000);
+
+            const delim = url.includes('?') ? '&' : '?';
+            script.src = `${url}${delim}${callbackParam}=${cbName}`;
+            document.body.appendChild(script);
+        });
+    };
+
+    // 1. 尝试 ip-api.com (HTTP, JSONP)
+    // 免费版仅支持 HTTP。在本地 file:// 协议下，加载 HTTP 脚本通常是允许的，且该服务返回正确的 MIME 类型，避免 ORB 拦截。
+    fetchJsonp('http://ip-api.com/json/?lang=zh-CN')
+        .then(data => {
+            if (data.status !== 'success') throw new Error('ip-api failed');
+            displayIp(data.query, [data.city, data.country].filter(Boolean).join(', '));
+        })
+        .catch(() => {
+            // 2. 备用: ipify (HTTPS, JSONP). 仅返回 IP
+            // ipify 会返回 text/javascript 类型，兼容性极好
+            return fetchJsonp('https://api.ipify.org?format=jsonp')
+                .then(data => {
+                    displayIp(data.ip, '');
+                });
+        })
+        .catch(err => {
+            console.warn('GeoIP lookup failed completely:', err);
+        });
+
     // 拖拽事件处理
     dropZone.addEventListener('dragover', (e) => {
         e.preventDefault();
@@ -106,6 +175,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 } else {
                     // 完成
                     const data = parser.getResult();
+                    calculateNoise(data);
+                    calculateFFT(data);
                     displayInfo(data.header, data.stats, file);
                     renderCharts(data);
                     
@@ -130,7 +201,9 @@ document.addEventListener('DOMContentLoaded', () => {
             let name = 'Unknown';
             // 反向查找名称
             if (typeof MessageDefs !== 'undefined' && MessageDefs[type]) {
-                name = MessageDefs[type].name;
+                const rawName = MessageDefs[type].name;
+                // 尝试翻译名称
+                name = (typeof getChartName === 'function') ? getChartName(rawName, rawName) : rawName;
             }
             countsStr += `<li>${name} (${type}): ${count}</li>`;
         }
@@ -146,6 +219,268 @@ document.addEventListener('DOMContentLoaded', () => {
             <p><strong>帧类型统计:</strong></p>
             <ul>${countsStr}</ul>
         `;
+    }
+
+    function calculateNoise(data) {
+        const accData = data.datasets['LocalPosition_Acc'];
+        if (!accData) return;
+
+        const time = accData.data.Time;
+        const accX = accData.data.AccX;
+        const accY = accData.data.AccY;
+        const accZ = accData.data.AccZ;
+        
+        if (!time || !accX || !accY || !accZ) return;
+
+        const len = time.length;
+        // Range arrays
+        const rangeX = new Float64Array(len);
+        const rangeY = new Float64Array(len);
+        const rangeZ = new Float64Array(len);
+        
+        const windowSize = 0.1; // 0.1 seconds
+        
+        // Helper to compute Range (Max - Min) for specific array
+        function computeRange(input, output) {
+             let left = 0;
+             
+             for (let right = 0; right < len; right++) {
+                 // Slide window
+                 while (time[right] - time[left] > windowSize) {
+                     left++;
+                 }
+                 
+                 // Find min/max in current window [left, right]
+                 // Since window is small (0.1s), simple loop is efficient enough
+                 let min = input[right];
+                 let max = input[right];
+                 for (let k = left; k < right; k++) {
+                     const val = input[k];
+                     if (val < min) min = val;
+                     if (val > max) max = val;
+                 }
+
+                 output[right] = max - min;
+             }
+        }
+
+        computeRange(accX, rangeX);
+        computeRange(accY, rangeY);
+        computeRange(accZ, rangeZ);
+        
+        data.datasets['IMU_Noise_Range'] = {
+            name: 'IMU Noise Analysis (0.1s Range/Peak-to-Peak)',
+            data: {
+                Time: time, 
+                RangeX: rangeX,
+                RangeY: rangeY,
+                RangeZ: rangeZ
+            }
+        };
+
+        // Variance arrays
+        const varX = new Float64Array(len);
+        const varY = new Float64Array(len);
+        const varZ = new Float64Array(len);
+
+        // Helper to compute var for specific array
+        function computeVar(input, output) {
+             let left = 0;
+             let sum = 0;
+             let sumSq = 0;
+             
+             for (let right = 0; right < len; right++) {
+                 const val = input[right];
+                 sum += val;
+                 sumSq += val * val;
+                 
+                 // Slide window
+                 while (time[right] - time[left] > windowSize) {
+                     const removeVal = input[left];
+                     sum -= removeVal;
+                     sumSq -= removeVal * removeVal;
+                     left++;
+                 }
+                 
+                 const count = right - left + 1;
+                 if (count > 1) {
+                     let v = (sumSq - (sum * sum) / count) / count; 
+                     output[right] = v > 0 ? v : 0;
+                 } else {
+                     output[right] = 0;
+                 }
+             }
+        }
+
+        computeVar(accX, varX);
+        computeVar(accY, varY);
+        computeVar(accZ, varZ);
+        
+        data.datasets['IMU_Noise_Var'] = {
+            name: 'IMU Noise Analysis (0.1s Variance)',
+            data: {
+                Time: time,
+                VarX: varX,
+                VarY: varY,
+                VarZ: varZ
+            }
+        };
+    }
+
+    function calculateFFT(data) {
+        const accData = data.datasets['LocalPosition_Acc'];
+        if (!accData) return;
+
+        const time = accData.data.Time;
+        const accDataMap = {
+            AccX: accData.data.AccX,
+            AccY: accData.data.AccY,
+            AccZ: accData.data.AccZ
+        };
+        
+        if (!time || time.length < 128) return;
+
+        // 1. Estimate Sample Rate
+        const duration = time[time.length - 1] - time[0];
+        const count = time.length;
+        if (duration <= 0) return;
+        const avgFs = (count - 1) / duration;
+        
+        // 2. Setup FFT params
+        const fftSize = 4096; // 4096 points for better resolution
+        if (count < fftSize) return; // Not enough data
+        
+        // Setup Hanning Window
+        const window = new Float64Array(fftSize);
+        for(let i=0; i<fftSize; i++) {
+            window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (fftSize - 1)));
+        }
+
+        // Iterative Radix-2 FFT
+        function fftIterations(re, im) {
+            const n = re.length;
+            const levels = Math.log2(n);
+            
+            // Bit reversal
+            for (let i = 0; i < n; i++) {
+                let rev = 0;
+                let val = i;
+                for (let j = 0; j < levels; j++) {
+                    rev = (rev << 1) | (val & 1);
+                    val >>>= 1;
+                }
+                if (rev > i) {
+                    const tr = re[i]; re[i] = re[rev]; re[rev] = tr;
+                    const ti = im[i]; im[i] = im[rev]; im[rev] = ti;
+                }
+            }
+            
+            // Butterfly
+            for (let size = 2; size <= n; size *= 2) {
+                const half = size / 2;
+                const angle = -2 * Math.PI / size;
+                const wStepRe = Math.cos(angle);
+                const wStepIm = Math.sin(angle);
+                
+                for (let i = 0; i < n; i += size) {
+                    let wRe = 1;
+                    let wIm = 0;
+                    for (let j = 0; j < half; j++) {
+                        const even = i + j;
+                        const odd = i + j + half;
+                        
+                        const tRe = wRe * re[odd] - wIm * im[odd];
+                        const tIm = wRe * im[odd] + wIm * re[odd];
+                        
+                        re[odd] = re[even] - tRe;
+                        im[odd] = im[even] - tIm;
+                        re[even] = re[even] + tRe;
+                        im[even] = im[even] + tIm;
+                        
+                        const wTemp = wRe;
+                        wRe = wRe * wStepRe - wIm * wStepIm;
+                        wIm = wTemp * wStepIm + wIm * wStepRe;
+                    }
+                }
+            }
+        }
+        
+        // Welch Method
+        const hopSize = fftSize / 2;
+        const numSegments = Math.floor((count - fftSize) / hopSize) + 1;
+        
+        const finalData = {};
+
+        for (const [key, signal] of Object.entries(accDataMap)) {
+            if (!signal) continue;
+            
+            const avgSpec = new Float64Array(fftSize / 2);
+            const re = new Float64Array(fftSize);
+            const im = new Float64Array(fftSize);
+            
+            // Compute average scale factor for window
+            // For Hanning window, coherent gain is 0.5. To recover amplitude, divide by N/2.
+            
+            let segmentsProcessed = 0;
+            
+            for (let i = 0; i < numSegments; i++) {
+                const start = i * hopSize;
+                
+                // Copy and window
+                for(let j=0; j<fftSize; j++) {
+                    re[j] = signal[start + j] * window[j];
+                    im[j] = 0;
+                }
+                
+                fftIterations(re, im);
+                
+                // Accumulate magnitude
+                for(let j=0; j<fftSize/2; j++) {
+                    // Magnitude = sqrt(re^2 + im^2) * 2 / N (for one-sided spectrum, excluding DC) based on window scaling
+                    // Normalization is tricky.
+                    // Simple: abs(fft) / N
+                    // Current window sum = N/2. 
+                    // Let's use standard magnitude: sqrt(re^2+im^2)
+                    // We will normalize at the end.
+                    const mag = Math.sqrt(re[j]*re[j] + im[j]*im[j]);
+                    avgSpec[j] += mag;
+                }
+                segmentsProcessed++;
+            }
+            
+            // Normalize
+            // 2/N factor for one-sided, plus 2 for Hanning window loss = 4/N?
+            // Empirical: For sin wave amp A, indices peak at A * N / 2. Hanning reduces by half -> A * N / 4. 
+            // So we multiply by 4/N.
+            const norm = 4.0 / fftSize / segmentsProcessed;
+            
+            for(let j=0; j<fftSize/2; j++) {
+                avgSpec[j] *= norm;
+            }
+            // Fix DC
+            avgSpec[0] = 0; 
+
+            finalData['FFT_' + key] = avgSpec;
+        }
+
+        // Generate Frequency Axis
+        const freqs = new Float64Array(fftSize / 2);
+        const df = avgFs / fftSize;
+        const limitHz = avgFs / 2;
+        for(let i=0; i<fftSize/2; i++) {
+            const f = i * df;
+            if (f > limitHz) break;
+            freqs[i] = f;
+        }
+        
+        data.datasets['IMU_Acc_FFT'] = {
+            name: `IMU Acc FFT Analysis (Avg Fs: ${avgFs.toFixed(1)}Hz)`,
+            xAxisLabel: 'Frequency (Hz)',
+            data: {
+                Time: freqs, // Reuse Time field for X-axis
+                ...finalData
+            }
+        };
     }
 
     function renderCharts(data) {
@@ -196,10 +531,27 @@ document.addEventListener('DOMContentLoaded', () => {
             headerDiv.style.alignItems = 'center';
             headerDiv.style.marginBottom = '10px';
 
-            const title = document.createElement('h3');
-            title.innerText = dataset.name;
-            title.style.margin = '0';
-            headerDiv.appendChild(title);
+            const leftToolVals = document.createElement('div');
+            
+            const btnCollapse = document.createElement('button');
+            btnCollapse.innerText = '▼';
+            btnCollapse.className = 'btn-tool btn-collapse';
+            btnCollapse.style.marginRight = '8px';
+            btnCollapse.title = '折叠/展开图表';
+            leftToolVals.appendChild(btnCollapse);
+
+            // Display title next to collapse button for clarity when collapsed, 
+            // even though chart has internal title.
+            // When collapsed, chart title is hidden, so we need something visible.
+            const headerTitle = document.createElement('span');
+            headerTitle.innerText = getChartName(key, dataset.name);
+            headerTitle.style.fontWeight = 'bold';
+            headerTitle.style.display = 'none'; // Hidden by default, shown when collapsed
+            leftToolVals.appendChild(headerTitle);
+
+            headerDiv.appendChild(leftToolVals);
+
+            // External title removed
 
             const toolbar = document.createElement('div');
             toolbar.style.display = 'flex';
@@ -221,8 +573,34 @@ document.addEventListener('DOMContentLoaded', () => {
             const chartDiv = document.createElement('div');
             chartDiv.className = 'pending-chart'; 
             chartDiv.style.minHeight = '400px'; 
+            chartDiv.style.transition = 'height 0.3s ease, min-height 0.3s ease, opacity 0.3s ease';
             wrapper.appendChild(chartDiv);
             chartsContainer.appendChild(wrapper);
+
+            let isCollapsed = false;
+            btnCollapse.addEventListener('click', () => {
+                isCollapsed = !isCollapsed;
+                if (isCollapsed) {
+                    btnCollapse.innerText = '▶';
+                    chartDiv.style.height = '0px';
+                    chartDiv.style.minHeight = '0px';
+                    chartDiv.style.overflow = 'hidden';
+                    chartDiv.style.opacity = '0';
+                    headerTitle.style.display = 'inline'; // Show title when collapsed
+                    // Hide other tools when collapsed to clean up
+                    btnReset.style.display = 'none';
+                    btnSave.style.display = 'none';
+                } else {
+                    btnCollapse.innerText = '▼';
+                    chartDiv.style.height = ''; // Auto height (or previous height)
+                    chartDiv.style.minHeight = '400px';
+                    chartDiv.style.overflow = '';
+                    chartDiv.style.opacity = '1';
+                    headerTitle.style.display = 'none'; // Hide title (chart has internal title)
+                    btnReset.style.display = '';
+                    btnSave.style.display = '';
+                }
+            });
 
             chartDiv._initChart = () => {
                 const keys = dataset.fieldNames || Object.keys(dataset.data);
@@ -231,7 +609,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (seriesKeys.length === 0) return;
 
                 const plotData = [ dataset.data.Time ];
-                const seriesOpts = [ { label: "Time" } ];
+                const seriesOpts = [ { label: dataset.xAxisLabel || "Time" } ];
                 
                 const len = dataset.data.Time.length;
 
@@ -276,16 +654,35 @@ document.addEventListener('DOMContentLoaded', () => {
                     return;
                 }
 
+                const getChartWidth = () => {
+                   return chartDiv.clientWidth > 0 ? chartDiv.clientWidth : Math.min(window.innerWidth - 40, 1100);
+                };
+
                 const opts = {
-                    title: dataset.name,
-                    width: 1100,
+                    title: getChartName(key, dataset.name), // Restored internal title
+                    width: getChartWidth(),
                     height: 400,
                     cursor: { drag: { x: false, y: false }, points: { show: false } },
-                    scales: { x: { time: false, title: "Time (s)" }, y: { auto: true } },
+                    scales: {
+                         x: { time: false, title: dataset.xAxisLabel || "Time (s)" }, 
+                         y: { auto: true } 
+                    },
                     series: seriesOpts
                 };
 
                 const u = new uPlot(opts, plotData, chartDiv);
+                
+                // Add resize listener
+                const resizeObserver = new ResizeObserver(entries => {
+                    for (let entry of entries) {
+                         // Only resize if width changed significantly to avoid loops
+                         const newWidth = entry.contentRect.width;
+                         if (newWidth > 0 && Math.abs(newWidth - u.width) > 10) {
+                              u.setSize({ width: newWidth, height: 400 });
+                         }
+                    }
+                });
+                resizeObserver.observe(chartDiv);
 
                 btnReset.addEventListener('click', () => { u.setData(u.data, true); });
 
@@ -407,14 +804,57 @@ document.addEventListener('DOMContentLoaded', () => {
         if (trajSource && trajSource.data.PosX.length === trajSource.data.PosY.length && trajSource.data.PosX.length > 0) {
             const wrapper = document.createElement('div');
             wrapper.className = 'chart-wrapper';
-            const title = document.createElement('h3');
-            title.innerText = 'FlightTrajectory_3D';
-            wrapper.appendChild(title);
+            
+            const headerDiv = document.createElement('div');
+            headerDiv.style.display = 'flex';
+            headerDiv.style.justifyContent = 'space-between'; // Need space for left tools
+            headerDiv.style.alignItems = 'center';
+            headerDiv.style.marginBottom = '10px';
+
+            const leftToolVals = document.createElement('div');
+            const btnCollapse = document.createElement('button');
+            btnCollapse.innerText = '▼';
+            btnCollapse.className = 'btn-tool btn-collapse';
+            btnCollapse.style.marginRight = '8px';
+            btnCollapse.title = '折叠/展开图表';
+            leftToolVals.appendChild(btnCollapse);
+
+            const headerTitle = document.createElement('span');
+            headerTitle.innerText = getChartName('FlightTrajectory_3D', 'FlightTrajectory_3D');
+            headerTitle.style.fontWeight = 'bold';
+            headerTitle.style.display = 'none'; 
+            leftToolVals.appendChild(headerTitle);
+
+            headerDiv.appendChild(leftToolVals);
+            wrapper.appendChild(headerDiv);
+
+            // External title removed
             const chartDiv = document.createElement('div');
-            chartDiv.style.width = '1100px';
+            chartDiv.style.width = '100%'; // Adaptive width
             chartDiv.style.height = '600px';
+            chartDiv.style.transition = 'height 0.3s ease, min-height 0.3s ease, opacity 0.3s ease';
             wrapper.appendChild(chartDiv);
             chartsContainer.appendChild(wrapper);
+
+            let isCollapsed = false;
+            btnCollapse.addEventListener('click', () => {
+                isCollapsed = !isCollapsed;
+                if (isCollapsed) {
+                    btnCollapse.innerText = '▶';
+                    chartDiv.style.height = '0px';
+                    chartDiv.style.minHeight = '0px';
+                    chartDiv.style.overflow = 'hidden';
+                    chartDiv.style.opacity = '0';
+                    headerTitle.style.display = 'inline';
+                } else {
+                    btnCollapse.innerText = '▼';
+                    chartDiv.style.height = '600px'; 
+                    chartDiv.style.minHeight = '';
+                    chartDiv.style.overflow = '';
+                    chartDiv.style.opacity = '1';
+                    headerTitle.style.display = 'none';
+                }
+            });
 
             const timeArr = trajSource.data.Time;
             const posY = trajSource.data.PosY;
@@ -444,37 +884,97 @@ document.addEventListener('DOMContentLoaded', () => {
             }
             if (currentSeg.x.length > 0) segments.push(currentSeg);
 
-            let maxAbsX = 1, maxAbsY = 1, maxAbsZ = 1;
+            let minX = Infinity, maxX = -Infinity;
+            let minY = Infinity, maxY = -Infinity;
+            let minZ = Infinity, maxZ = -Infinity;
+            
             segments.forEach(seg => {
-                seg.x.forEach(v => maxAbsX = Math.max(maxAbsX, Math.abs(v)));
-                seg.y.forEach(v => maxAbsY = Math.max(maxAbsY, Math.abs(v)));
-                seg.z.forEach(v => maxAbsZ = Math.max(maxAbsZ, Math.abs(v)));
+                seg.x.forEach(v => {
+                    if (v < minX) minX = v;
+                    if (v > maxX) maxX = v;
+                });
+                seg.y.forEach(v => {
+                    if (v < minY) minY = v;
+                    if (v > maxY) maxY = v;
+                });
+                seg.z.forEach(v => {
+                    if (v < minZ) minZ = v;
+                    if (v > maxZ) maxZ = v;
+                });
             });
+            
+            // Fallback for empty data
+            if (minX === Infinity) { minX = -1; maxX = 1; }
+            if (minY === Infinity) { minY = -1; maxY = 1; }
+            if (minZ === Infinity) { minZ = -1; maxZ = 1; }
 
             const segColors = [
                 '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
                 '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
             ];
 
-            const traces = segments.map((seg, idx) => ({
-                x: seg.x,
-                y: seg.y,
-                z: seg.z,
-                mode: 'lines',
-                type: 'scatter3d',
-                line: { width: 4, color: segColors[idx % segColors.length] },
-                name: `Segment ${idx + 1}`,
-                hoverinfo: 'x+y+z+name'
-            }));
+            const traces = [];
+
+            segments.forEach((seg, idx) => {
+                const color = segColors[idx % segColors.length];
+                const groupName = `group_${idx}`;
+                // Use default name if translation fails, but we don't have segment names in translation file currently
+                const segmentName = `Segment ${idx + 1}`;
+
+                // 1. Path Line
+                traces.push({
+                    x: seg.x,
+                    y: seg.y,
+                    z: seg.z,
+                    mode: 'lines',
+                    type: 'scatter3d',
+                    line: { width: 4, color: color },
+                    name: segmentName,
+                    legendgroup: groupName,
+                    showlegend: true,
+                    hoverinfo: 'x+y+z+name'
+                });
+
+                if (seg.x.length > 0) {
+                    // 2. Start Point (Green Circle)
+                    traces.push({
+                        x: [seg.x[0]],
+                        y: [seg.y[0]],
+                        z: [seg.z[0]],
+                        mode: 'markers',
+                        type: 'scatter3d',
+                        marker: { size: 5, color: '#00cc00', symbol: 'circle' },
+                        name: `${segmentName} Start`,
+                        legendgroup: groupName,
+                        showlegend: false, // Linked to line
+                        hoverinfo: 'x+y+z+name'
+                    });
+
+                    // 3. End Point (Red Circle)
+                    const last = seg.x.length - 1;
+                    traces.push({
+                        x: [seg.x[last]],
+                        y: [seg.y[last]],
+                        z: [seg.z[last]],
+                        mode: 'markers',
+                        type: 'scatter3d',
+                        marker: { size: 5, color: '#cc0000', symbol: 'circle' },
+                        name: `${segmentName} End`,
+                        legendgroup: groupName,
+                        showlegend: false, // Linked to line
+                        hoverinfo: 'x+y+z+name'
+                    });
+                }
+            });
 
             const layout = {
-                title: `FlightTrajectory_3D (Sample Rate: 1/${step})`,
+                title: `${getChartName('FlightTrajectory_3D', 'FlightTrajectory_3D')}`, // Removed Sample Rate display
                 margin: { l: 0, r: 0, b: 0, t: 40 },
                 showlegend: segments.length > 1, 
                 scene: {
-                    xaxis: { title: 'X', range: [-maxAbsX, maxAbsX] },
-                    yaxis: { title: 'Y', range: [-maxAbsY, maxAbsY] },
-                    zaxis: { title: 'Z', range: [-maxAbsZ, maxAbsZ] },
+                    xaxis: { title: 'X' },
+                    yaxis: { title: 'Y' },
+                    zaxis: { title: 'Z' },
                     aspectmode: 'data'
                 }
             };
