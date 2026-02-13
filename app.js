@@ -6,6 +6,425 @@ document.addEventListener('DOMContentLoaded', () => {
     const chartsContainer = document.getElementById('charts-container');
     const loading = document.getElementById('loading');
     const tr = (key, fallback = key) => (typeof getChartName === 'function' ? getChartName(key, fallback) : fallback);
+    const analysisCache = new Map();
+    const ANALYSIS_CACHE_LIMIT = 3;
+
+    const getFileCacheKey = (file) => `${file.name}::${file.size}::${file.lastModified}`;
+    const saveAnalysisCache = (cacheKey, data) => {
+        if (!cacheKey || !data) return;
+        if (analysisCache.has(cacheKey)) analysisCache.delete(cacheKey);
+        analysisCache.set(cacheKey, data);
+        if (analysisCache.size > ANALYSIS_CACHE_LIMIT) {
+            const oldestKey = analysisCache.keys().next().value;
+            analysisCache.delete(oldestKey);
+        }
+    };
+
+    const globalPanState = { active: null };
+    let globalPanDelegationInstalled = false;
+
+    const ensureGlobalPanDelegation = () => {
+        if (globalPanDelegationInstalled) return;
+
+        document.addEventListener('mousemove', (e) => {
+            const ctx = globalPanState.active;
+            if (!ctx) return;
+
+            const { u, panStartX, panStartMin, panStartMax, rawTimeArr, onViewportChanged } = ctx;
+            const rect = u.over.getBoundingClientRect();
+            const cx = e.clientX - rect.left;
+            const xRange = panStartMax - panStartMin;
+            if (rect.width <= 0 || xRange === 0) return;
+
+            const valAtStart = u.posToVal(panStartX, 'x');
+            const valAtNow = u.posToVal(cx, 'x');
+            const shift = valAtStart - valAtNow;
+            let newMin = panStartMin + shift;
+            let newMax = panStartMax + shift;
+
+            if (rawTimeArr && rawTimeArr.length > 0) {
+                const minTime = rawTimeArr[0];
+                const maxTime = rawTimeArr[rawTimeArr.length - 1];
+                const totalDuration = maxTime - minTime;
+                if (xRange >= totalDuration) {
+                    newMin = minTime;
+                    newMax = maxTime;
+                } else {
+                    if (newMin < minTime) { newMin = minTime; newMax = newMin + xRange; }
+                    if (newMax > maxTime) { newMax = maxTime; newMin = newMax - xRange; }
+                }
+            }
+
+            u.setScale('x', { min: newMin, max: newMax });
+            if (typeof onViewportChanged === 'function') onViewportChanged(newMin, newMax);
+        });
+
+        document.addEventListener('mouseup', () => {
+            const ctx = globalPanState.active;
+            if (ctx && typeof ctx.onInteractionEnd === 'function') {
+                ctx.onInteractionEnd();
+            }
+            globalPanState.active = null;
+        });
+
+        globalPanDelegationInstalled = true;
+    };
+
+    const ANALYSIS_WORKER_SOURCE = `
+self.onmessage = (event) => {
+    try {
+        const payload = event.data || {};
+        const time = payload.time;
+        const accX = payload.accX;
+        const accY = payload.accY;
+        const accZ = payload.accZ;
+
+        if (!time || !accX || !accY || !accZ || time.length < 128) {
+            self.postMessage({ success: false });
+            return;
+        }
+
+        const fft = computeFFT(time, accX, accY, accZ);
+        const spectrogram = computeSpectrogram(time, accX, accY, accZ);
+
+        self.postMessage({
+            success: true,
+            fft,
+            spectrogram
+        });
+    } catch (err) {
+        self.postMessage({ success: false, error: err && err.message ? err.message : String(err) });
+    }
+};
+
+function fftIterations(re, im) {
+    const n = re.length;
+    const levels = Math.log2(n);
+    for (let i = 0; i < n; i++) {
+        let rev = 0;
+        let val = i;
+        for (let j = 0; j < levels; j++) {
+            rev = (rev << 1) | (val & 1);
+            val >>>= 1;
+        }
+        if (rev > i) {
+            const tr = re[i]; re[i] = re[rev]; re[rev] = tr;
+            const ti = im[i]; im[i] = im[rev]; im[rev] = ti;
+        }
+    }
+    for (let size = 2; size <= n; size *= 2) {
+        const half = size / 2;
+        const angle = -2 * Math.PI / size;
+        const wStepRe = Math.cos(angle);
+        const wStepIm = Math.sin(angle);
+        for (let i = 0; i < n; i += size) {
+            let wRe = 1;
+            let wIm = 0;
+            for (let j = 0; j < half; j++) {
+                const even = i + j;
+                const odd = i + j + half;
+                const tRe = wRe * re[odd] - wIm * im[odd];
+                const tIm = wRe * im[odd] + wIm * re[odd];
+                re[odd] = re[even] - tRe;
+                im[odd] = im[even] - tIm;
+                re[even] = re[even] + tRe;
+                im[even] = im[even] + tIm;
+                const wTemp = wRe;
+                wRe = wRe * wStepRe - wIm * wStepIm;
+                wIm = wTemp * wStepIm + wIm * wStepRe;
+            }
+        }
+    }
+}
+
+function computeFFT(time, accX, accY, accZ) {
+    const duration = time[time.length - 1] - time[0];
+    const count = time.length;
+    if (duration <= 0 || count < 4096) return null;
+
+    const avgFs = (count - 1) / duration;
+    const fftSize = 4096;
+    const hopSize = fftSize / 2;
+    const numSegments = Math.floor((count - fftSize) / hopSize) + 1;
+    if (numSegments <= 0) return null;
+
+    const window = new Float64Array(fftSize);
+    for (let i = 0; i < fftSize; i++) {
+        window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (fftSize - 1)));
+    }
+
+    const finalData = {};
+    const accDataMap = { AccX: accX, AccY: accY, AccZ: accZ };
+
+    for (const [key, signal] of Object.entries(accDataMap)) {
+        if (!signal) continue;
+        const avgSpec = new Float64Array(fftSize / 2);
+        const re = new Float64Array(fftSize);
+        const im = new Float64Array(fftSize);
+        let segmentsProcessed = 0;
+
+        for (let i = 0; i < numSegments; i++) {
+            const start = i * hopSize;
+            for (let j = 0; j < fftSize; j++) {
+                re[j] = signal[start + j] * window[j];
+                im[j] = 0;
+            }
+            fftIterations(re, im);
+            for (let j = 0; j < fftSize / 2; j++) {
+                const mag = Math.sqrt(re[j] * re[j] + im[j] * im[j]);
+                avgSpec[j] += mag;
+            }
+            segmentsProcessed++;
+        }
+
+        const norm = 4.0 / fftSize / segmentsProcessed;
+        for (let j = 0; j < fftSize / 2; j++) {
+            avgSpec[j] *= norm;
+        }
+        avgSpec[0] = 0;
+        finalData['FFT_' + key] = avgSpec;
+    }
+
+    const freqs = new Float64Array(fftSize / 2);
+    const df = avgFs / fftSize;
+    const limitHz = avgFs / 2;
+    for (let i = 0; i < fftSize / 2; i++) {
+        const f = i * df;
+        if (f > limitHz) break;
+        freqs[i] = f;
+    }
+
+    return { avgFs, freqs, finalData };
+}
+
+function computeSpectrogram(time, accX, accY, accZ) {
+    if (!time || time.length < 512) return null;
+
+    const duration = time[time.length - 1] - time[0];
+    const count = time.length;
+    if (duration <= 0) return null;
+    const avgFs = (count - 1) / duration;
+
+    const targetWindowSec = 1.0;
+    let fftSize = 1;
+    const targetSamples = avgFs * targetWindowSec;
+    while (fftSize < targetSamples) fftSize *= 2;
+    if (fftSize < 256) fftSize = 256;
+    if (fftSize > 2048) fftSize = 2048;
+
+    const hopSize = Math.floor(fftSize / 4);
+    const numBins = fftSize / 2;
+
+    const window = new Float64Array(fftSize);
+    for (let i = 0; i < fftSize; i++) {
+        window[i] = 0.5 * (1 - Math.cos(2 * Math.PI * i / (fftSize - 1)));
+    }
+
+    const bitRev = new Uint16Array(fftSize);
+    const levels = Math.log2(fftSize);
+    for (let i = 0; i < fftSize; i++) {
+        let rev = 0;
+        let val = i;
+        for (let j = 0; j < levels; j++) {
+            rev = (rev << 1) | (val & 1);
+            val >>>= 1;
+        }
+        bitRev[i] = rev;
+    }
+
+    const realHop = hopSize;
+    const frameCount = Math.floor((count - fftSize) / realHop) + 1;
+    if (frameCount <= 0) return null;
+
+    const xValues = new Float64Array(frameCount);
+    const zTransposed = Array.from({ length: numBins }, () => new Float64Array(frameCount));
+
+    const re = new Float64Array(fftSize);
+    const im = new Float64Array(fftSize);
+    const binPower = new Float64Array(numBins);
+
+    let maxDB = -Infinity;
+    const signals = [accX, accY, accZ];
+
+    let frameIdx = 0;
+    for (let i = 0; i <= count - fftSize; i += realHop) {
+        const tCenter = time[0] + (i + fftSize / 2) / avgFs;
+        xValues[frameIdx] = tCenter;
+        binPower.fill(0);
+
+        for (let axis = 0; axis < 3; axis++) {
+            const signal = signals[axis];
+            if (!signal) continue;
+
+            let mean = 0;
+            for (let k = 0; k < fftSize; k++) mean += signal[i + k];
+            mean /= fftSize;
+
+            for (let k = 0; k < fftSize; k++) {
+                re[k] = (signal[i + k] - mean) * window[k];
+                im[k] = 0;
+            }
+
+            for (let k = 0; k < fftSize; k++) {
+                const r = bitRev[k];
+                if (r > k) {
+                    const tr = re[k]; re[k] = re[r]; re[r] = tr;
+                    const ti = im[k]; im[k] = im[r]; im[r] = ti;
+                }
+            }
+
+            for (let size = 2; size <= fftSize; size *= 2) {
+                const half = size / 2;
+                const angle = -2 * Math.PI / size;
+                const wStepRe = Math.cos(angle);
+                const wStepIm = Math.sin(angle);
+
+                for (let j = 0; j < fftSize; j += size) {
+                    let wRe = 1;
+                    let wIm = 0;
+                    for (let k = 0; k < half; k++) {
+                        const even = j + k;
+                        const odd = j + k + half;
+
+                        const tRe = wRe * re[odd] - wIm * im[odd];
+                        const tIm = wRe * im[odd] + wIm * re[odd];
+
+                        re[odd] = re[even] - tRe;
+                        im[odd] = im[even] - tIm;
+                        re[even] = re[even] + tRe;
+                        im[even] = im[even] + tIm;
+
+                        const wTemp = wRe;
+                        wRe = wRe * wStepRe - wIm * wStepIm;
+                        wIm = wTemp * wStepIm + wIm * wStepRe;
+                    }
+                }
+            }
+
+            for (let k = 0; k < numBins; k++) {
+                binPower[k] += (re[k] * re[k] + im[k] * im[k]);
+            }
+        }
+
+        for (let k = 0; k < numBins; k++) {
+            let p = binPower[k];
+            if (p < 1e-10) p = 1e-10;
+            const db = 10 * Math.log10(p);
+            if (db > maxDB) maxDB = db;
+            zTransposed[k][frameIdx] = db;
+        }
+
+        frameIdx++;
+    }
+
+    const yValues = new Float64Array(numBins);
+    const df = avgFs / fftSize;
+    const cutoff = avgFs / 2;
+    for (let k = 0; k < numBins; k++) {
+        const f = k * df;
+        if (f > cutoff) break;
+        yValues[k] = f;
+    }
+
+    return {
+        x: xValues,
+        y: yValues,
+        z: zTransposed,
+        maxDB
+    };
+}
+`;
+
+    const createAnalysisWorker = () => {
+        const blob = new Blob([ANALYSIS_WORKER_SOURCE], { type: 'text/javascript' });
+        const blobUrl = URL.createObjectURL(blob);
+        const worker = new Worker(blobUrl);
+        worker.__blobUrl = blobUrl;
+        return worker;
+    };
+
+    const computeFrequencyAnalysisAsync = (data) => {
+        return new Promise((resolve) => {
+            const accData = data.datasets['LocalPosition_Acc'];
+            if (!accData || !accData.data) return resolve(false);
+
+            const time = accData.data.Time;
+            const accX = accData.data.AccX;
+            const accY = accData.data.AccY;
+            const accZ = accData.data.AccZ;
+
+            if (!time || !accX || !accY || !accZ || time.length < 128) return resolve(false);
+            if (typeof Worker === 'undefined') return resolve(false);
+
+            let worker;
+            try {
+                worker = createAnalysisWorker();
+            } catch (err) {
+                return resolve(false);
+            }
+
+            const cleanup = () => {
+                if (worker) {
+                    if (worker.__blobUrl) URL.revokeObjectURL(worker.__blobUrl);
+                    worker.terminate();
+                }
+            };
+
+            worker.onmessage = (event) => {
+                try {
+                    const msg = event.data || {};
+                    if (!msg.success) {
+                        cleanup();
+                        return resolve(false);
+                    }
+
+                    const fft = msg.fft;
+                    if (fft && fft.freqs && fft.finalData) {
+                        data.datasets['IMU_Acc_FFT'] = {
+                            name: `IMU Acc FFT Analysis (Avg Fs: ${Number(fft.avgFs || 0).toFixed(1)}Hz)`,
+                            xAxisLabel: 'Frequency (Hz)',
+                            data: {
+                                Time: fft.freqs,
+                                ...fft.finalData
+                            }
+                        };
+                    }
+
+                    const spec = msg.spectrogram;
+                    if (spec && spec.x && spec.y && spec.z) {
+                        data.datasets['IMU_Spectrogram'] = {
+                            name: 'IMU Vibration Spectrogram (Combined Power)',
+                            type: 'spectrogram',
+                            maxDB: spec.maxDB,
+                            data: {
+                                x: spec.x,
+                                y: spec.y,
+                                z: spec.z
+                            }
+                        };
+                    }
+
+                    cleanup();
+                    resolve(true);
+                } catch (err) {
+                    cleanup();
+                    resolve(false);
+                }
+            };
+
+            worker.onerror = () => {
+                cleanup();
+                resolve(false);
+            };
+
+            worker.postMessage({
+                time,
+                accX,
+                accY,
+                accZ
+            });
+        });
+    };
 
     // 尝试获取 IP 及地理位置
     // 改用 JSONP 方式，以支持本地 file:// 协议运行时的跨域请求
@@ -153,11 +572,70 @@ document.addEventListener('DOMContentLoaded', () => {
         if (e.target.files.length > 0) processFile(e.target.files[0]);
     });
 
+    // UX: Disable page scroll when wheel is used inside chart areas.
+    // This keeps focus on chart zoom/pan and prevents accidental fast page jumps.
+    let isMouseInChartArea = false;
+
+    const updateMouseInChartArea = (e) => {
+        if (!e || !Number.isFinite(e.clientX) || !Number.isFinite(e.clientY)) return;
+        const el = document.elementFromPoint(e.clientX, e.clientY);
+        if (el && typeof el.closest === 'function') {
+            const chartWrapper = el.closest('.chart-wrapper');
+            isMouseInChartArea = !!(chartWrapper && chartsContainer.contains(chartWrapper));
+        } else {
+            isMouseInChartArea = false;
+        }
+    };
+
+    const preventPageScrollInCharts = (e) => {
+        let insideChart = false;
+
+        if (isMouseInChartArea) insideChart = true;
+
+        const target = e.target;
+        if (!insideChart && target && typeof target.closest === 'function') {
+            const chartWrapper = target.closest('.chart-wrapper');
+            insideChart = !!(chartWrapper && chartsContainer.contains(chartWrapper));
+        }
+
+        if (!insideChart && typeof e.composedPath === 'function') {
+            const path = e.composedPath();
+            for (let i = 0; i < path.length; i++) {
+                const node = path[i];
+                if (node && node.classList && node.classList.contains('chart-wrapper') && chartsContainer.contains(node)) {
+                    insideChart = true;
+                    break;
+                }
+            }
+        }
+
+        if (!insideChart && Number.isFinite(e.clientX) && Number.isFinite(e.clientY)) {
+            const el = document.elementFromPoint(e.clientX, e.clientY);
+            if (el && typeof el.closest === 'function') {
+                const chartWrapper = el.closest('.chart-wrapper');
+                insideChart = !!(chartWrapper && chartsContainer.contains(chartWrapper));
+            }
+        }
+
+        if (insideChart) {
+            e.preventDefault();
+        }
+    };
+
+    const wheelListenerOptions = { passive: false, capture: true };
+    chartsContainer.addEventListener('wheel', preventPageScrollInCharts, wheelListenerOptions);
+    document.addEventListener('wheel', preventPageScrollInCharts, wheelListenerOptions);
+    document.addEventListener('mousewheel', preventPageScrollInCharts, wheelListenerOptions);
+    document.addEventListener('DOMMouseScroll', preventPageScrollInCharts, wheelListenerOptions);
+    document.addEventListener('mousemove', updateMouseInChartArea, { capture: true });
+
     function processFile(file) {
         if (!file.name.endsWith('.aclog')) {
             alert(tr('Please upload a .aclog file', 'Please upload a .aclog file'));
             return;
         }
+
+        const fileCacheKey = getFileCacheKey(file);
 
         // UI Reset
         chartsContainer.classList.add('hidden');
@@ -171,6 +649,22 @@ document.addEventListener('DOMContentLoaded', () => {
         if (progressBar) progressBar.style.width = '0%';
         if (progressBar) progressBar.innerText = '0%';
         if (loadingText) loadingText.innerText = tr('Reading file...', 'Reading file...');
+
+        if (analysisCache.has(fileCacheKey)) {
+            const cachedData = analysisCache.get(fileCacheKey);
+            if (loadingText) loadingText.innerText = tr('Loading from memory cache...', 'Loading from memory cache...');
+            if (progressBar) progressBar.style.width = '100%';
+            if (progressBar) progressBar.innerText = '100%';
+
+            requestAnimationFrame(() => {
+                displayInfo(cachedData.header, cachedData.stats, file, cachedData.datasets);
+                renderCharts(cachedData);
+                loading.classList.add('hidden');
+                infoPanel.classList.remove('hidden');
+                chartsContainer.classList.remove('hidden');
+            });
+            return;
+        }
 
         const reader = new FileReader();
         
@@ -186,7 +680,7 @@ document.addEventListener('DOMContentLoaded', () => {
              if (loadingText) loadingText.innerText = tr('Parsing data...', 'Parsing data...');
              setTimeout(() => {
                 try {
-                    analyzeDataAsync(e.target.result, file);
+                    analyzeDataAsync(e.target.result, file, fileCacheKey);
                 } catch (err) {
                      console.error(err);
                      alert(tr('Parse Error', 'Parse Error') + ': ' + err.message);
@@ -197,9 +691,41 @@ document.addEventListener('DOMContentLoaded', () => {
         reader.readAsArrayBuffer(file);
     }
 
-    function analyzeDataAsync(arrayBuffer, file) {
+    function analyzeDataAsync(arrayBuffer, file, fileCacheKey) {
         const parser = new ACLoreParser(arrayBuffer);
         const progressBar = document.getElementById('progress-bar');
+        const loadingText = document.getElementById('loading-text');
+
+        const finalizeAnalysis = (data) => {
+            buildPosVelComparisonCharts(data);
+            buildRealtimeUsedSensorChart(data);
+            buildRealtimeUsedSensorComparisonCharts(data);
+            saveAnalysisCache(fileCacheKey, data);
+            displayInfo(data.header, data.stats, file, data.datasets);
+            renderCharts(data);
+
+            loading.classList.add('hidden');
+            infoPanel.classList.remove('hidden');
+            chartsContainer.classList.remove('hidden');
+        };
+
+        const runFrequencyAnalysis = (data) => {
+            if (loadingText) loadingText.innerText = tr('Computing FFT/Spectrogram...', 'Computing FFT/Spectrogram...');
+
+            return computeFrequencyAnalysisAsync(data)
+                .then((usedWorker) => {
+                    if (!usedWorker) {
+                        calculateFFT(data);
+                        calculateSpectrogram(data);
+                    }
+                    finalizeAnalysis(data);
+                })
+                .catch(() => {
+                    calculateFFT(data);
+                    calculateSpectrogram(data);
+                    finalizeAnalysis(data);
+                });
+        };
         
         try {
             parser.startParse();
@@ -227,17 +753,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     const data = parser.getResult();
                     buildEstimatorInfoGroup(data);
                     calculateNoise(data);
-                    calculateFFT(data);
-                    calculateSpectrogram(data);
-                    buildPosVelComparisonCharts(data);
-                    buildRealtimeUsedSensorChart(data);
-                    buildRealtimeUsedSensorComparisonCharts(data);
-                    displayInfo(data.header, data.stats, file, data.datasets);
-                    renderCharts(data);
-                    
-                    loading.classList.add('hidden');
-                    infoPanel.classList.remove('hidden');
-                    chartsContainer.classList.remove('hidden');
+
+                    runFrequencyAnalysis(data);
                 }
             } catch (err) {
                  console.error(err);
@@ -328,20 +845,31 @@ document.addEventListener('DOMContentLoaded', () => {
         const windowSize = 0.1; 
         
         function computeRange(input, output) {
-             let left = 0;
-             for (let right = 0; right < len; right++) {
-                 while (time[right] - time[left] > windowSize) {
-                     left++;
-                 }
-                 let min = input[right];
-                 let max = input[right];
-                 for (let k = left; k < right; k++) {
-                     const val = input[k];
-                     if (val < min) min = val;
-                     if (val > max) max = val;
-                 }
-                 output[right] = max - min;
-             }
+            const minDeque = new Int32Array(len);
+            const maxDeque = new Int32Array(len);
+            let minHead = 0, minTail = 0;
+            let maxHead = 0, maxTail = 0;
+            let left = 0;
+
+            for (let right = 0; right < len; right++) {
+                const vr = input[right];
+
+                while (minTail > minHead && input[minDeque[minTail - 1]] >= vr) minTail--;
+                minDeque[minTail++] = right;
+
+                while (maxTail > maxHead && input[maxDeque[maxTail - 1]] <= vr) maxTail--;
+                maxDeque[maxTail++] = right;
+
+                while (time[right] - time[left] > windowSize) {
+                    if (minTail > minHead && minDeque[minHead] === left) minHead++;
+                    if (maxTail > maxHead && maxDeque[maxHead] === left) maxHead++;
+                    left++;
+                }
+
+                const minVal = input[minDeque[minHead]];
+                const maxVal = input[maxDeque[maxHead]];
+                output[right] = maxVal - minVal;
+            }
         }
 
         computeRange(accX, rangeX);
@@ -560,27 +1088,27 @@ document.addEventListener('DOMContentLoaded', () => {
             bitRev[i] = rev;
         }
 
-        const zValues = []; 
-        const xValues = [];
+        // Pre-allocate output buffers to reduce GC pressure on long logs.
+        const realHop = hopSize;
+        const frameCount = Math.floor((count - fftSize) / realHop) + 1;
+        if (frameCount <= 0) return;
+
+        const xValues = new Float64Array(frameCount);
+        const zTransposed = Array.from({ length: numBins }, () => new Float64Array(frameCount));
         
         const re = new Float64Array(fftSize);
         const im = new Float64Array(fftSize);
         const binPower = new Float64Array(numBins);
-        
-        // 移除最大段数限制
-        // 直接使用 calculated hopSize (75% overlap)，这将生成像素密度最高的频谱图
-        // 哪怕这会导致生成的 Canvas 异常巨大 (注意：过大的 Canvas 可能会在移动端遇到兼容性问题)
-        const realHop = hopSize;
 
         let maxDB = -Infinity; 
 
         const signals = [accX, accY, accZ];
 
+        let frameIdx = 0;
         for (let i = 0; i <= count - fftSize; i += realHop) {
             const tCenter = time[0] + (i + fftSize / 2) / avgFs;
-            xValues.push(tCenter);
-
-            const binPower = new Float64Array(numBins);
+            xValues[frameIdx] = tCenter;
+            binPower.fill(0);
 
             for(let axis=0; axis<3; axis++) {
                 const signal = signals[axis];
@@ -636,24 +1164,14 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             }
 
-            const row = [];
             for (let k = 0; k < numBins; k++) {
                 let p = binPower[k];
                 if (p < 1e-10) p = 1e-10;
                 const db = 10 * Math.log10(p);
                 if (db > maxDB) maxDB = db;
-                row.push(db);
+                zTransposed[k][frameIdx] = db;
             }
-            zValues.push(row);
-        }
-
-        const zTransposed = [];
-        for (let f = 0; f < numBins; f++) {
-            const freqRow = new Float64Array(zValues.length);
-            for (let t = 0; t < zValues.length; t++) {
-                freqRow[t] = zValues[t][f];
-            }
-            zTransposed.push(freqRow);
+            frameIdx++;
         }
 
         const yValues = new Float64Array(numBins);
@@ -724,21 +1242,6 @@ document.addEventListener('DOMContentLoaded', () => {
             return 'Unclassified Sensor';
         };
 
-        const nearestIndex = (timeArr, t) => {
-            if (!timeArr || timeArr.length === 0) return -1;
-            let left = 0;
-            let right = timeArr.length - 1;
-            while (left < right) {
-                const mid = (left + right) >> 1;
-                if (timeArr[mid] < t) left = mid + 1;
-                else right = mid;
-            }
-            const idx = left;
-            if (idx === 0) return 0;
-            const prev = idx - 1;
-            return Math.abs(timeArr[idx] - t) < Math.abs(timeArr[prev] - t) ? idx : prev;
-        };
-
         const buildSeries = (sensor, estimator, fields, inspectLabel, groupKey, groupName, subgroupKey, subgroupName) => {
             if (!sensor || !estimator) return null;
             const sTime = sensor.data.Time;
@@ -756,9 +1259,17 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             const matchIndex = new Int32Array(sTime.length);
+            let j = 0;
+            const eLast = eTime.length - 1;
             for (let i = 0; i < sTime.length; i++) {
-                const j = nearestIndex(eTime, sTime[i]);
-                matchIndex[i] = j;
+                const t = sTime[i];
+                while (j < eLast && eTime[j] < t) j++;
+                if (j === 0) {
+                    matchIndex[i] = 0;
+                } else {
+                    const prev = j - 1;
+                    matchIndex[i] = Math.abs(eTime[j] - t) < Math.abs(eTime[prev] - t) ? j : prev;
+                }
             }
 
             for (let i = 0; i < sTime.length; i++) {
@@ -810,7 +1321,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const hasPos = activePosFields.length > 0;
             const hasVel = activeVelFields.length > 0;
-            const combinedGroup = hasPos && hasVel;
             const sensorCategory = classifySensorCategory(activePosFields, activeVelFields);
 
             ds.sensorCategory = sensorCategory;
@@ -1023,11 +1533,32 @@ document.addEventListener('DOMContentLoaded', () => {
 
     function renderCharts(data) {
         chartsContainer.innerHTML = ''; 
+        ensureGlobalPanDelegation();
 
         const palette = [
             "#f44336", "#2196f3", "#4caf50", "#ff9800", "#9c27b0", 
             "#3f51b5", "#00bcd4", "#795548", "#607d8b", "#e91e63"
         ];
+
+        const enableWebGLExtensionsForPlotly = (container) => {
+            if (!container) return;
+            const canvases = container.querySelectorAll('canvas');
+            canvases.forEach((canvas) => {
+                const gl2 = canvas.getContext('webgl2');
+                if (gl2) {
+                    gl2.getExtension('EXT_color_buffer_float');
+                    return;
+                }
+
+                const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+                if (!gl) return;
+
+                gl.getExtension('WEBGL_color_buffer_float');
+                gl.getExtension('EXT_color_buffer_float');
+                gl.getExtension('OES_texture_float');
+                gl.getExtension('OES_texture_float_linear');
+            });
+        };
 
         const trComposite = (text) => {
             if (typeof text !== 'string' || text.length === 0) return text;
@@ -1116,6 +1647,128 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             });
         }, observerOptions);
+
+        const MAX_RENDER_POINTS = 12000;
+        const MAX_RENDER_POINTS_CAP = 24000;
+        const MIN_RENDER_POINTS = 3000;
+        const VIEW_OVERSCAN_RATIO = 0.35;
+        const RESLICE_DEBOUNCE_MS = 80;
+        const FAST_RENDER_POINT_FACTOR = 1.5;
+        const HIGH_RENDER_POINT_FACTOR = 4.0;
+        const INTERACTION_END_RESAMPLE_MS = 140;
+        const RAW_RENDER_VIEW_POINT_THRESHOLD = 2500;
+        const RAW_RENDER_VIEW_SPAN_RATIO = 0.02;
+        const RAW_RENDER_USE_FULL_DATA = true;
+        const INTERACTION_END_FORCE_RAW_FULL = true;
+        const PRECISE_RAW_MAX_TOTAL_POINTS = 2000;
+        const SLICE_EDGE_PAD_MIN_POINTS = 24;
+        const SLICE_EDGE_PAD_MAX_POINTS = 320;
+        const SLICE_EDGE_PAD_RATIO = 0.12;
+
+        const lowerBound = (arr, val) => {
+            let left = 0;
+            let right = arr.length;
+            while (left < right) {
+                const mid = (left + right) >> 1;
+                if (arr[mid] < val) left = mid + 1;
+                else right = mid;
+            }
+            return left;
+        };
+
+        const upperBound = (arr, val) => {
+            let left = 0;
+            let right = arr.length;
+            while (left < right) {
+                const mid = (left + right) >> 1;
+                if (arr[mid] <= val) left = mid + 1;
+                else right = mid;
+            }
+            return left;
+        };
+
+        const sliceRange = (arr, start, end) => {
+            if (arr && typeof arr.subarray === 'function') return arr.subarray(start, end);
+            return arr.slice(start, end);
+        };
+
+        const buildSlicedRenderData = (rawData, minX, maxX, targetPoints = MAX_RENDER_POINTS, focusMin = null, focusMax = null, forceNoDownsample = false) => {
+            const x = rawData[0];
+            if (!x || x.length === 0) return rawData;
+
+            const start = Math.max(0, Math.min(x.length - 1, lowerBound(x, minX)));
+            const endExclusive = Math.max(start + 1, Math.min(x.length, upperBound(x, maxX)));
+            const visiblePoints = Math.max(1, endExclusive - start);
+            const edgePadPoints = Math.max(
+                SLICE_EDGE_PAD_MIN_POINTS,
+                Math.min(SLICE_EDGE_PAD_MAX_POINTS, Math.ceil(visiblePoints * SLICE_EDGE_PAD_RATIO))
+            );
+            const paddedStart = Math.max(0, start - edgePadPoints);
+            const paddedEndExclusive = Math.min(x.length, endExclusive + edgePadPoints);
+            const points = paddedEndExclusive - paddedStart;
+            const renderPoints = Math.max(MIN_RENDER_POINTS, Math.min(MAX_RENDER_POINTS_CAP, targetPoints));
+
+            if (forceNoDownsample) {
+                return rawData.map(arr => sliceRange(arr, paddedStart, paddedEndExclusive));
+            }
+
+            if (points <= renderPoints) {
+                return rawData.map(arr => sliceRange(arr, paddedStart, paddedEndExclusive));
+            }
+
+            const step = Math.ceil(points / renderPoints);
+            const sampleIndex = [];
+            for (let i = paddedStart; i < paddedEndExclusive; i += step) sampleIndex.push(i);
+
+            const anchorSet = new Set();
+            anchorSet.add(paddedStart);
+            const last = paddedEndExclusive - 1;
+            anchorSet.add(last);
+
+            if (Number.isFinite(focusMin) && Number.isFinite(focusMax) && focusMax > focusMin) {
+                const focusStart = Math.max(start, Math.min(last, lowerBound(x, focusMin)));
+                const focusEndExclusive = Math.max(focusStart + 1, Math.min(paddedEndExclusive, upperBound(x, focusMax)));
+                const focusEnd = Math.max(focusStart, focusEndExclusive - 1);
+                const focusStartPrev = Math.max(paddedStart, focusStart - 1);
+                const focusEndNext = Math.min(last, focusEnd + 1);
+                anchorSet.add(focusStart);
+                anchorSet.add(focusEnd);
+                anchorSet.add(focusStartPrev);
+                anchorSet.add(focusEndNext);
+            }
+
+            for (const idx of anchorSet) sampleIndex.push(idx);
+            sampleIndex.sort((a, b) => a - b);
+
+            let write = 0;
+            for (let i = 0; i < sampleIndex.length; i++) {
+                if (i === 0 || sampleIndex[i] !== sampleIndex[i - 1]) {
+                    sampleIndex[write++] = sampleIndex[i];
+                }
+            }
+            sampleIndex.length = write;
+
+            const out = new Array(rawData.length);
+            for (let s = 0; s < rawData.length; s++) {
+                const src = rawData[s];
+                const dst = new Float64Array(sampleIndex.length);
+                for (let i = 0; i < sampleIndex.length; i++) dst[i] = src[sampleIndex[i]];
+                out[s] = dst;
+            }
+            return out;
+        };
+
+        const uplotByDiv = new WeakMap();
+        const sharedResizeObserver = new ResizeObserver((entries) => {
+            for (const entry of entries) {
+                const u = uplotByDiv.get(entry.target);
+                if (!u) continue;
+                const newWidth = entry.contentRect.width;
+                if (newWidth > 0 && Math.abs(newWidth - u.width) > 10) {
+                    u.setSize({ width: newWidth, height: 400 });
+                }
+            }
+        });
 
         const isDebugText = (text) => typeof text === 'string' && /debug/i.test(text);
         const isInspectText = (text) => typeof text === 'string' && /\binspect\b/i.test(text);
@@ -1349,8 +2002,6 @@ document.addEventListener('DOMContentLoaded', () => {
             headerDiv.style.alignItems = 'center';
             headerDiv.style.marginBottom = '10px';
             headerDiv.style.position = 'relative';
-            headerDiv.style.position = 'relative';
-            headerDiv.style.position = 'relative';
 
             const left = document.createElement('div');
             left.style.display = 'flex';
@@ -1519,6 +2170,718 @@ document.addEventListener('DOMContentLoaded', () => {
             return subInfo;
         };
 
+        const initUplotTimeSeriesChart = ({ chartDiv, dataset, key, btnReset, btnSave }) => {
+            const keys = dataset.fieldNames || Object.keys(dataset.data);
+            const seriesKeys = keys.filter(k => k !== 'Time');
+
+            if (seriesKeys.length === 0) return;
+
+            const cacheToken = `${key}::${seriesKeys.join('|')}::${dataset.data.Time.length}::${dataset.xAxisLabel || ''}`;
+            let plotData;
+            let seriesOpts;
+            let dataConsistent;
+
+            if (dataset.__uplotCache && dataset.__uplotCache.token === cacheToken) {
+                ({ plotData, seriesOpts, dataConsistent } = dataset.__uplotCache);
+            } else {
+                plotData = [dataset.data.Time];
+                seriesOpts = [{ label: dataset.xAxisLabel || "Time" }];
+
+                const len = dataset.data.Time.length;
+                dataConsistent = true;
+                for (let i = 0; i < seriesKeys.length; i++) {
+                    const fieldName = seriesKeys[i];
+                    const arr = dataset.data[fieldName];
+                    if (arr.length !== len) {
+                        dataConsistent = false;
+                        break;
+                    }
+
+                    if (key === 'MotorOutput') {
+                        let allInvalid = true;
+                        if (arr[0] > 10000 && arr[len - 1] > 10000) {
+                            allInvalid = true;
+                            for (let j = 0; j < len; j += 100) {
+                                if (arr[j] <= 10000) {
+                                    allInvalid = false;
+                                    break;
+                                }
+                            }
+                        } else {
+                            allInvalid = false;
+                        }
+                        if (allInvalid) continue;
+                    }
+
+                    plotData.push(arr);
+                    seriesOpts.push({
+                        label: fieldName,
+                        stroke: palette[i % palette.length],
+                        width: 1,
+                        scale: 'y',
+                        paths: uPlot.paths.stepped({ align: 1 })
+                    });
+                }
+
+                dataset.__uplotCache = {
+                    token: cacheToken,
+                    plotData,
+                    seriesOpts,
+                    dataConsistent
+                };
+            }
+
+            if (!dataConsistent) return;
+            if (plotData.length <= 1) {
+                chartDiv.innerHTML = `<p style="text-align:center;color:#999">${tr('No valid data', 'No valid data')}</p>`;
+                return;
+            }
+
+            const getChartWidth = () => {
+                return chartDiv.clientWidth > 0 ? chartDiv.clientWidth : Math.min(window.innerWidth - 40, 1100);
+            };
+
+            const opts = {
+                width: getChartWidth(),
+                height: 400,
+                cursor: { drag: { x: false, y: false }, points: { show: false } },
+                scales: {
+                    x: { time: false, title: dataset.xAxisLabel || "Time (s)" },
+                    y: { auto: true }
+                },
+                series: seriesOpts
+            };
+
+            const rawPlotData = plotData;
+            const rawTimeArr = rawPlotData[0];
+            const fullMinTime = rawTimeArr[0];
+            const fullMaxTime = rawTimeArr[rawTimeArr.length - 1];
+            const getTargetRenderPoints = () => {
+                const width = chartDiv.clientWidth > 0 ? chartDiv.clientWidth : 1000;
+                return {
+                    fast: Math.floor(width * FAST_RENDER_POINT_FACTOR),
+                    high: Math.floor(width * HIGH_RENDER_POINT_FACTOR)
+                };
+            };
+
+            let currentSliceMin = fullMinTime;
+            let currentSliceMax = fullMaxTime;
+
+            const computeOverscanBounds = (viewMin, viewMax) => {
+                const span = Math.max(1e-9, viewMax - viewMin);
+                const pad = span * VIEW_OVERSCAN_RATIO;
+                let min = viewMin - pad;
+                let max = viewMax + pad;
+                if (min < fullMinTime) min = fullMinTime;
+                if (max > fullMaxTime) max = fullMaxTime;
+                if (max <= min) {
+                    min = fullMinTime;
+                    max = fullMaxTime;
+                }
+                return { min, max };
+            };
+
+            const initialPoints = getTargetRenderPoints();
+            const initialRenderData = buildSlicedRenderData(rawPlotData, fullMinTime, fullMaxTime, initialPoints.high, fullMinTime, fullMaxTime);
+
+            const u = new uPlot(opts, initialRenderData, chartDiv);
+            uplotByDiv.set(chartDiv, u);
+            sharedResizeObserver.observe(chartDiv);
+
+            let resliceTimer = 0;
+            let endInteractionTimer = 0;
+            let currentRenderMode = 'sampled';
+
+            const getViewportPointCount = (min, max) => {
+                const viewStart = Math.max(0, lowerBound(rawTimeArr, min));
+                const viewEnd = Math.min(rawTimeArr.length, upperBound(rawTimeArr, max));
+                return Math.max(1, viewEnd - viewStart);
+            };
+
+            const syncViewportSlice = (force = false, quality = 'fast') => {
+                const sx = u.scales.x;
+                const viewMin = Number.isFinite(sx?.min) ? sx.min : fullMinTime;
+                const viewMax = Number.isFinite(sx?.max) ? sx.max : fullMaxTime;
+
+                const viewPoints = getViewportPointCount(viewMin, viewMax);
+                const fullSpan = Math.max(1e-9, fullMaxTime - fullMinTime);
+                const viewSpan = Math.max(1e-9, viewMax - viewMin);
+                const requireRaw = viewPoints <= RAW_RENDER_VIEW_POINT_THRESHOLD || (viewSpan / fullSpan) <= RAW_RENDER_VIEW_SPAN_RATIO;
+                const canUsePreciseRawFull = viewPoints <= PRECISE_RAW_MAX_TOTAL_POINTS;
+                const useRawFull = requireRaw && RAW_RENDER_USE_FULL_DATA && canUsePreciseRawFull;
+
+                if (!force) {
+                    if (useRawFull && currentRenderMode === 'raw-full') return;
+                    if (!requireRaw && currentRenderMode === 'sampled' && viewMin >= currentSliceMin && viewMax <= currentSliceMax) return;
+                }
+
+                if (useRawFull) {
+                    currentSliceMin = fullMinTime;
+                    currentSliceMax = fullMaxTime;
+                    currentRenderMode = 'raw-full';
+                    u.setData(rawPlotData, false);
+                    return;
+                }
+
+                if (!force && viewMin >= currentSliceMin && viewMax <= currentSliceMax && (!requireRaw || currentRenderMode === 'raw')) {
+                    return;
+                }
+
+                const bounds = computeOverscanBounds(viewMin, viewMax);
+                currentSliceMin = bounds.min;
+                currentSliceMax = bounds.max;
+
+                const pts = getTargetRenderPoints();
+                const target = quality === 'high' ? pts.high : pts.fast;
+                const useRaw = requireRaw;
+                const sliced = buildSlicedRenderData(rawPlotData, bounds.min, bounds.max, target, viewMin, viewMax, useRaw);
+                currentRenderMode = useRaw ? 'raw' : 'sampled';
+                u.setData(sliced, false);
+            };
+
+            const scheduleInteractionEndHighQualitySync = () => {
+                if (endInteractionTimer) clearTimeout(endInteractionTimer);
+                endInteractionTimer = setTimeout(() => {
+                    endInteractionTimer = 0;
+                    const sx = u.scales.x;
+                    const viewMin = Number.isFinite(sx?.min) ? sx.min : fullMinTime;
+                    const viewMax = Number.isFinite(sx?.max) ? sx.max : fullMaxTime;
+                    const viewPoints = getViewportPointCount(viewMin, viewMax);
+                    const canUsePreciseRawFull = viewPoints <= PRECISE_RAW_MAX_TOTAL_POINTS;
+                    if (INTERACTION_END_FORCE_RAW_FULL && canUsePreciseRawFull) {
+                        currentSliceMin = fullMinTime;
+                        currentSliceMax = fullMaxTime;
+                        currentRenderMode = 'raw-full';
+                        u.setData(rawPlotData, false);
+                        return;
+                    }
+                    scheduleViewportSliceSync(true, 'high');
+                }, INTERACTION_END_RESAMPLE_MS);
+            };
+
+            const scheduleViewportSliceSync = (force = false, quality = 'fast') => {
+                if (force) {
+                    if (resliceTimer) {
+                        clearTimeout(resliceTimer);
+                        resliceTimer = 0;
+                    }
+                    syncViewportSlice(true, quality);
+                    return;
+                }
+                if (resliceTimer) return;
+                resliceTimer = setTimeout(() => {
+                    resliceTimer = 0;
+                    syncViewportSlice(false, quality);
+                }, RESLICE_DEBOUNCE_MS);
+            };
+
+            btnReset.addEventListener('click', () => {
+                currentSliceMin = fullMinTime;
+                currentSliceMax = fullMaxTime;
+                currentRenderMode = 'sampled';
+                const pts = getTargetRenderPoints();
+                const fullData = buildSlicedRenderData(rawPlotData, fullMinTime, fullMaxTime, pts.high, fullMinTime, fullMaxTime);
+                u.setData(fullData, false);
+                u.setScale('x', { min: fullMinTime, max: fullMaxTime });
+            });
+
+            btnSave.addEventListener('click', () => {
+                const originalCanvas = u.ctx.canvas;
+                const dpr = window.devicePixelRatio || 1;
+                const titleHeight = 50 * dpr;
+                const exportTitle = getExportChartTitle(key, dataset);
+                const newCanvas = document.createElement('canvas');
+                newCanvas.width = originalCanvas.width;
+                newCanvas.height = originalCanvas.height + titleHeight;
+                const ctx = newCanvas.getContext('2d');
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(0, 0, newCanvas.width, newCanvas.height);
+                ctx.fillStyle = '#000000';
+                ctx.font = `bold ${24 * dpr}px Arial, sans-serif`;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(exportTitle, newCanvas.width / 2, titleHeight / 2);
+                ctx.drawImage(originalCanvas, 0, titleHeight);
+                const url = newCanvas.toDataURL('image/png');
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `${dataset.name}.png`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+            });
+
+            u.over.addEventListener("mousedown", (e) => {
+                if (e.button !== 0) return;
+                e.preventDefault();
+                const rect = u.over.getBoundingClientRect();
+                const cx = e.clientX - rect.left;
+                if (cx < 0 || cx > rect.width) return;
+                const scaleX = u.scales.x;
+                globalPanState.active = {
+                    u,
+                    panStartX: cx,
+                    panStartMin: scaleX.min,
+                    panStartMax: scaleX.max,
+                    rawTimeArr,
+                    onViewportChanged: () => {
+                        scheduleViewportSliceSync(false, 'fast');
+                    },
+                    onInteractionEnd: scheduleInteractionEndHighQualitySync
+                };
+            });
+
+            chartDiv.addEventListener("wheel", e => {
+                e.preventDefault();
+                const rect = u.over.getBoundingClientRect();
+                const cx = e.clientX - rect.left;
+                if (cx < 0 || cx > rect.width) return;
+                const scaleX = u.scales.x;
+                const xVal = u.posToVal(cx, "x");
+                const xRange = scaleX.max - scaleX.min;
+                const xMin = scaleX.min;
+                const isZoomIn = e.deltaY < 0;
+                const factor = isZoomIn ? 0.9 : 1.1;
+                const newRange = xRange * factor;
+                const ratio = xRange === 0 ? 0 : (xVal - xMin) / xRange;
+                let newMin = xVal - (ratio * newRange);
+                let newMax = newMin + newRange;
+                const timeArr = rawTimeArr;
+                if (timeArr && timeArr.length > 0) {
+                    const minTime = timeArr[0];
+                    const maxTime = timeArr[timeArr.length - 1];
+                    const totalDuration = maxTime - minTime;
+                    if (newRange >= totalDuration) {
+                        newMin = minTime;
+                        newMax = maxTime;
+                    } else {
+                        if (newMin < minTime) { newMin = minTime; newMax = newMin + newRange; }
+                        if (newMax > maxTime) { newMax = maxTime; newMin = newMax - newRange; if (newMin < minTime) newMin = minTime; }
+                    }
+                }
+                u.batch(() => { u.setScale("x", { min: newMin, max: newMax }); });
+                scheduleViewportSliceSync(false, 'fast');
+                scheduleInteractionEndHighQualitySync();
+            });
+        };
+
+        const createCollapsibleChartFrame = ({
+            titleText,
+            collapseButtonTitle,
+            expandedHeight,
+            expandedMinHeight = '',
+            chartWidth = '100%',
+            chartClassName = '',
+            onCollapseChange = null
+        }) => {
+            const wrapper = document.createElement('div');
+            wrapper.className = 'chart-wrapper';
+
+            const headerDiv = document.createElement('div');
+            headerDiv.style.display = 'flex';
+            headerDiv.style.justifyContent = 'center';
+            headerDiv.style.alignItems = 'center';
+            headerDiv.style.marginBottom = '10px';
+            headerDiv.style.position = 'relative';
+
+            const leftToolVals = document.createElement('div');
+            leftToolVals.style.display = 'flex';
+            leftToolVals.style.alignItems = 'center';
+            leftToolVals.style.justifyContent = 'center';
+            leftToolVals.style.width = '100%';
+            leftToolVals.style.position = 'relative';
+
+            const btnCollapse = document.createElement('button');
+            btnCollapse.innerText = '▼';
+            btnCollapse.className = 'btn-tool btn-collapse';
+            btnCollapse.style.position = 'absolute';
+            btnCollapse.style.left = '0';
+            btnCollapse.style.marginRight = '0';
+            if (collapseButtonTitle) btnCollapse.title = collapseButtonTitle;
+            leftToolVals.appendChild(btnCollapse);
+
+            const headerTitle = document.createElement('span');
+            headerTitle.innerText = titleText;
+            headerTitle.style.fontWeight = 'bold';
+            headerTitle.style.textAlign = 'center';
+            headerTitle.style.display = 'inline';
+            leftToolVals.appendChild(headerTitle);
+
+            headerDiv.appendChild(leftToolVals);
+            wrapper.appendChild(headerDiv);
+
+            const chartDiv = document.createElement('div');
+            chartDiv.style.width = chartWidth;
+            chartDiv.style.height = expandedHeight;
+            if (expandedMinHeight) chartDiv.style.minHeight = expandedMinHeight;
+            if (chartClassName) chartDiv.className = chartClassName;
+            chartDiv.style.transition = 'height 0.3s ease, min-height 0.3s ease, opacity 0.3s ease';
+            wrapper.appendChild(chartDiv);
+
+            let isCollapsed = false;
+            btnCollapse.addEventListener('click', () => {
+                isCollapsed = !isCollapsed;
+                if (isCollapsed) {
+                    btnCollapse.innerText = '▶';
+                    chartDiv.style.height = '0px';
+                    chartDiv.style.minHeight = '0px';
+                    chartDiv.style.overflow = 'hidden';
+                    chartDiv.style.opacity = '0';
+                    leftToolVals.style.justifyContent = 'flex-start';
+                    headerTitle.style.textAlign = 'left';
+                    headerTitle.style.paddingLeft = '44px';
+                } else {
+                    btnCollapse.innerText = '▼';
+                    chartDiv.style.height = expandedHeight;
+                    chartDiv.style.minHeight = expandedMinHeight;
+                    chartDiv.style.overflow = '';
+                    chartDiv.style.opacity = '1';
+                    leftToolVals.style.justifyContent = 'center';
+                    headerTitle.style.textAlign = 'center';
+                    headerTitle.style.paddingLeft = '0';
+                }
+                if (typeof onCollapseChange === 'function') {
+                    onCollapseChange(isCollapsed, { wrapper, headerDiv, chartDiv, leftToolVals, headerTitle, btnCollapse });
+                }
+            });
+
+            return { wrapper, headerDiv, chartDiv, leftToolVals, headerTitle, btnCollapse };
+        };
+
+        const renderTrajectory3DChart = ({ trajSource }) => {
+            const frame = createCollapsibleChartFrame({
+                titleText: getChartName('FlightTrajectory_3D', 'FlightTrajectory_3D'),
+                collapseButtonTitle: tr('Collapse/Expand chart', 'Collapse/Expand chart'),
+                expandedHeight: '600px'
+            });
+            const { wrapper, headerDiv, chartDiv } = frame;
+            chartsContainer.appendChild(wrapper);
+
+            const trajHelpBtn = createHelpButton(
+                () => getChartName('FlightTrajectory_3D', 'FlightTrajectory_3D'),
+                () => getHelpTextByContext({ kind: 'chart', key: 'FlightTrajectory_3D', dataset: null })
+            );
+            setHelpButtonPlacement(trajHelpBtn, wrapper, headerDiv, false);
+            frame.btnCollapse.addEventListener('click', () => {
+                const isCollapsed = frame.chartDiv.style.height === '0px';
+                setHelpButtonPlacement(trajHelpBtn, wrapper, headerDiv, isCollapsed);
+            });
+
+            const timeArr = trajSource.data.Time;
+            const posY = trajSource.data.PosY;
+            const posX = trajSource.data.PosX;
+            const posZ = trajSource.data.PosZ || [];
+
+            const totalPoints = timeArr.length;
+            const MAX_3D_POINTS = 50000;
+            const step = Math.ceil(totalPoints / MAX_3D_POINTS);
+
+            const segments = [];
+            let currentSeg = { x: [], y: [], z: [] };
+            const GAP_THRESHOLD = 1.0;
+
+            for (let i = 0; i < totalPoints; i += step) {
+                if (i > 0) {
+                    const prevI = i - step >= 0 ? i - step : i - 1;
+                    const dt = timeArr[i] - timeArr[prevI];
+                    if (dt > GAP_THRESHOLD * Math.max(1, step * 0.5)) {
+                        if (currentSeg.x.length > 0) segments.push(currentSeg);
+                        currentSeg = { x: [], y: [], z: [] };
+                    }
+                }
+                currentSeg.x.push(-posY[i]);
+                currentSeg.y.push(posX[i]);
+                currentSeg.z.push(posZ.length > i ? -posZ[i] : 0);
+            }
+            if (currentSeg.x.length > 0) segments.push(currentSeg);
+
+            let minX = Infinity, maxX = -Infinity;
+            let minY = Infinity, maxY = -Infinity;
+            let minZ = Infinity, maxZ = -Infinity;
+
+            segments.forEach(seg => {
+                seg.x.forEach(v => {
+                    if (v < minX) minX = v;
+                    if (v > maxX) maxX = v;
+                });
+                seg.y.forEach(v => {
+                    if (v < minY) minY = v;
+                    if (v > maxY) maxY = v;
+                });
+                seg.z.forEach(v => {
+                    if (v < minZ) minZ = v;
+                    if (v > maxZ) maxZ = v;
+                });
+            });
+
+            if (minX === Infinity) { minX = -1; maxX = 1; }
+            if (minY === Infinity) { minY = -1; maxY = 1; }
+            if (minZ === Infinity) { minZ = -1; maxZ = 1; }
+
+            const segColors = [
+                '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+                '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
+            ];
+
+            const traces = [];
+
+            segments.forEach((seg, idx) => {
+                const color = segColors[idx % segColors.length];
+                const groupName = `group_${idx}`;
+                const segmentName = `Segment ${idx + 1}`;
+
+                traces.push({
+                    x: seg.x,
+                    y: seg.y,
+                    z: seg.z,
+                    mode: 'lines',
+                    type: 'scatter3d',
+                    line: { width: 4, color: color },
+                    name: segmentName,
+                    legendgroup: groupName,
+                    showlegend: true,
+                    hoverinfo: 'x+y+z+name'
+                });
+
+                if (seg.x.length > 0) {
+                    traces.push({
+                        x: [seg.x[0]],
+                        y: [seg.y[0]],
+                        z: [seg.z[0]],
+                        mode: 'markers',
+                        type: 'scatter3d',
+                        marker: { size: 5, color: '#00cc00', symbol: 'circle' },
+                        name: `${segmentName} Start`,
+                        legendgroup: groupName,
+                        showlegend: false,
+                        hoverinfo: 'x+y+z+name'
+                    });
+
+                    const last = seg.x.length - 1;
+                    traces.push({
+                        x: [seg.x[last]],
+                        y: [seg.y[last]],
+                        z: [seg.z[last]],
+                        mode: 'markers',
+                        type: 'scatter3d',
+                        marker: { size: 5, color: '#cc0000', symbol: 'circle' },
+                        name: `${segmentName} End`,
+                        legendgroup: groupName,
+                        showlegend: false,
+                        hoverinfo: 'x+y+z+name'
+                    });
+                }
+            });
+
+            const layout = {
+                margin: { l: 0, r: 0, b: 0, t: 40 },
+                showlegend: segments.length > 1,
+                scene: {
+                    xaxis: { title: 'X' },
+                    yaxis: { title: 'Y' },
+                    zaxis: { title: 'Z' },
+                    aspectmode: 'data'
+                }
+            };
+            Plotly.newPlot(chartDiv, traces, layout, { displaylogo: false, responsive: true })
+                .then(() => {
+                    enableWebGLExtensionsForPlotly(chartDiv);
+                });
+
+            return wrapper;
+        };
+
+        const renderSpectrogramChart = ({ specData, firstSensorPanelWrapperRef, trajectoryWrapperRef }) => {
+            const tMap = (typeof ChartTranslations !== 'undefined') ? ChartTranslations : {};
+            const translatedName = tMap['IMU_Spectrogram'] || specData.name;
+            const frame = createCollapsibleChartFrame({
+                titleText: translatedName,
+                expandedHeight: '500px',
+                onCollapseChange: (isCollapsed, refs) => {
+                    if (!isCollapsed && refs.chartDiv.layout) {
+                        Plotly.relayout(refs.chartDiv, { 'xaxis.autorange': true, 'yaxis.autorange': true });
+                    }
+                    setHelpButtonPlacement(specHelpBtn, refs.wrapper, refs.headerDiv, isCollapsed);
+                }
+            });
+            const { wrapper, headerDiv, chartDiv } = frame;
+            if (firstSensorPanelWrapperRef && firstSensorPanelWrapperRef.parentNode === chartsContainer) {
+                chartsContainer.insertBefore(wrapper, firstSensorPanelWrapperRef);
+            } else if (trajectoryWrapperRef && trajectoryWrapperRef.parentNode === chartsContainer) {
+                chartsContainer.insertBefore(wrapper, trajectoryWrapperRef);
+            } else {
+                chartsContainer.appendChild(wrapper);
+            }
+
+            const specHelpBtn = createHelpButton(
+                () => translatedName,
+                () => getHelpTextByContext({ kind: 'chart', key: 'IMU_Spectrogram', dataset: specData })
+            );
+            setHelpButtonPlacement(specHelpBtn, wrapper, headerDiv, false);
+
+            const rawWidth = specData.data.x.length;
+            const rawHeight = specData.data.y.length;
+            const zValues = specData.data.z;
+
+            const zMax = specData.maxDB || 0;
+            const zMin = zMax - 60;
+
+            function getJetColor(v) {
+                let r = 0, g = 0, b = 0;
+                if (v < 0) v = 0; if (v > 1) v = 1;
+
+                if (v < 0.125) { r = 0; g = 0; b = 0.5 + 4 * v; }
+                else if (v < 0.375) { r = 0; g = 4 * (v - 0.125); b = 1; }
+                else if (v < 0.625) { r = 4 * (v - 0.375); g = 1; b = 1 - 4 * (v - 0.375); }
+                else if (v < 0.875) { r = 1; g = 1 - 4 * (v - 0.625); b = 0; }
+                else { r = 1 - 4 * (v - 0.875); g = 0; b = 0; }
+
+                return [Math.floor(r * 255), Math.floor(g * 255), Math.floor(b * 255)];
+            }
+
+            const xAll = specData.data.x;
+            const dt = (rawWidth > 1) ? (xAll[rawWidth - 1] - xAll[0]) / (rawWidth - 1) : 1;
+
+            const MAX_SLICE_WIDTH = 4096;
+            const imagesList = [];
+
+            const yTop = specData.data.y[rawHeight - 1];
+            const yHeight = yTop - specData.data.y[0];
+
+            for (let startCol = 0; startCol < rawWidth; startCol += MAX_SLICE_WIDTH) {
+                const sliceWidth = Math.min(MAX_SLICE_WIDTH, rawWidth - startCol);
+
+                const sliceCanvas = document.createElement('canvas');
+                sliceCanvas.width = sliceWidth;
+                sliceCanvas.height = rawHeight;
+                const sliceCtx = sliceCanvas.getContext('2d');
+                const imgData = sliceCtx.createImageData(sliceWidth, rawHeight);
+
+                for (let f = 0; f < rawHeight; f++) {
+                    const imgRow = rawHeight - 1 - f;
+                    const rowData = zValues[f];
+
+                    for (let t = 0; t < sliceWidth; t++) {
+                        const globalT = startCol + t;
+                        const db = rowData[globalT];
+
+                        const norm = (db - zMin) / (zMax - zMin);
+                        const [r, g, b] = getJetColor(norm);
+
+                        const idx = (imgRow * sliceWidth + t) * 4;
+                        imgData.data[idx] = r;
+                        imgData.data[idx + 1] = g;
+                        imgData.data[idx + 2] = b;
+                        imgData.data[idx + 3] = 255;
+                    }
+                }
+                sliceCtx.putImageData(imgData, 0, 0);
+
+                const xPos = xAll[startCol];
+                const endIdx = startCol + sliceWidth - 1;
+                let duration = xAll[endIdx] - xPos;
+                if (duration <= 0) duration = sliceWidth * dt;
+
+                imagesList.push({
+                    source: sliceCanvas.toDataURL(),
+                    xref: 'x',
+                    yref: 'y',
+                    x: xPos,
+                    y: yTop,
+                    sizex: duration,
+                    sizey: yHeight,
+                    sizing: 'stretch',
+                    layer: 'below'
+                });
+            }
+
+            const xStart = xAll[0];
+            const xEnd = xAll[rawWidth - 1];
+            const yStart = specData.data.y[0];
+            const yEnd = yTop;
+
+            const dummyTrace = {
+                x: [xStart, xEnd],
+                y: [yStart, yEnd],
+                z: [[zMin, zMin], [zMax, zMax]],
+                type: 'heatmap',
+                colorscale: 'Jet',
+                showscale: true,
+                colorbar: { title: 'Log Power (dB)' },
+                opacity: 0,
+                hoverinfo: 'none'
+            };
+
+            const layout = {
+                margin: { l: 60, r: 20, b: 50, t: 40 },
+                xaxis: {
+                    title: 'Time (s)',
+                    range: [xStart, xEnd],
+                    constrain: 'domain'
+                },
+                yaxis: {
+                    title: 'Frequency (Hz)',
+                    range: [yStart, yEnd],
+                },
+                dragmode: 'pan',
+                images: imagesList
+            };
+
+            Plotly.newPlot(chartDiv, [dummyTrace], layout, { displaylogo: false, responsive: true, scrollZoom: true })
+                .then(() => {
+                    enableWebGLExtensionsForPlotly(chartDiv);
+                    const imgs = chartDiv.querySelectorAll('image');
+                    imgs.forEach((img) => {
+                        img.style.imageRendering = 'pixelated';
+                        img.setAttribute('image-rendering', 'pixelated');
+                        img.setAttribute('shape-rendering', 'crispEdges');
+                    });
+
+                    const clampRange = (min, max, lo, hi) => {
+                        let span = max - min;
+                        const full = hi - lo;
+                        if (span <= 0) return { min: lo, max: hi };
+                        if (span >= full) return { min: lo, max: hi };
+                        if (min < lo) { min = lo; max = lo + span; }
+                        if (max > hi) { max = hi; min = hi - span; }
+                        return { min, max };
+                    };
+
+                    let isClamping = false;
+                    const clampAxes = (evt) => {
+                        if (isClamping || !evt) return;
+                        const xr0 = evt['xaxis.range[0]'];
+                        const xr1 = evt['xaxis.range[1]'];
+                        const yr0 = evt['yaxis.range[0]'];
+                        const yr1 = evt['yaxis.range[1]'];
+
+                        const updates = {};
+
+                        if (typeof xr0 === 'number' && typeof xr1 === 'number') {
+                            const clamped = clampRange(xr0, xr1, xStart, xEnd);
+                            if (clamped.min !== xr0 || clamped.max !== xr1) {
+                                updates['xaxis.range'] = [clamped.min, clamped.max];
+                            }
+                        }
+
+                        if (typeof yr0 === 'number' && typeof yr1 === 'number') {
+                            const clamped = clampRange(yr0, yr1, yStart, yEnd);
+                            if (clamped.min !== yr0 || clamped.max !== yr1) {
+                                updates['yaxis.range'] = [clamped.min, clamped.max];
+                            }
+                        }
+
+                        if (Object.keys(updates).length > 0) {
+                            isClamping = true;
+                            Plotly.relayout(chartDiv, updates).then(() => { isClamping = false; });
+                        }
+                    };
+
+                    chartDiv.on('plotly_relayouting', clampAxes);
+                    chartDiv.on('plotly_relayout', clampAxes);
+                });
+        };
+
         const sortedEntries = Object.entries(data.datasets).sort(compareDatasetEntries);
         for (const [key, dataset] of sortedEntries) {
             if (key === 'IMU_Spectrogram') continue;
@@ -1648,651 +3011,23 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             chartDiv._initChart = () => {
-                const keys = dataset.fieldNames || Object.keys(dataset.data);
-                const seriesKeys = keys.filter(k => k !== 'Time');
-                
-                if (seriesKeys.length === 0) return;
-
-                const plotData = [ dataset.data.Time ];
-                const seriesOpts = [ { label: dataset.xAxisLabel || "Time" } ];
-                
-                const len = dataset.data.Time.length;
-
-                let dataConsistent = true;
-                for (let i = 0; i < seriesKeys.length; i++) {
-                    const fieldName = seriesKeys[i];
-                    const arr = dataset.data[fieldName];
-                    if (arr.length !== len) {
-                        dataConsistent = false;
-                        break;
-                    }
-
-                    if (key === 'MotorOutput') {
-                        let allInvalid = true;
-                        if (arr[0] > 10000 && arr[len-1] > 10000) {
-                            allInvalid = true;
-                            for (let j = 0; j < len; j += 100) {
-                                if (arr[j] <= 10000) {
-                                    allInvalid = false;
-                                    break;
-                                }
-                            }
-                        } else {
-                            allInvalid = false;
-                        }
-                        if (allInvalid) continue;
-                    }
-
-                    plotData.push(arr);
-                    seriesOpts.push({
-                        label: fieldName,
-                        stroke: palette[i % palette.length],
-                        width: 1,
-                        scale: 'y',
-                        paths: uPlot.paths.stepped({ align: 1 })
-                    });
-                }
-
-                if (!dataConsistent) return;
-                if (plotData.length <= 1) {
-                    chartDiv.innerHTML = `<p style="text-align:center;color:#999">${tr('No valid data', 'No valid data')}</p>`;
-                    return;
-                }
-
-                const getChartWidth = () => {
-                   return chartDiv.clientWidth > 0 ? chartDiv.clientWidth : Math.min(window.innerWidth - 40, 1100);
-                };
-
-                const opts = {
-                    width: getChartWidth(),
-                    height: 400,
-                    cursor: { drag: { x: false, y: false }, points: { show: false } },
-                    scales: {
-                         x: { time: false, title: dataset.xAxisLabel || "Time (s)" }, 
-                         y: { auto: true } 
-                    },
-                    series: seriesOpts
-                };
-
-                const u = new uPlot(opts, plotData, chartDiv);
-                
-                const resizeObserver = new ResizeObserver(entries => {
-                    for (let entry of entries) {
-                         const newWidth = entry.contentRect.width;
-                         if (newWidth > 0 && Math.abs(newWidth - u.width) > 10) {
-                              u.setSize({ width: newWidth, height: 400 });
-                         }
-                    }
-                });
-                resizeObserver.observe(chartDiv);
-
-                btnReset.addEventListener('click', () => { u.setData(u.data, true); });
-
-                btnSave.addEventListener('click', () => {
-                    const originalCanvas = u.ctx.canvas;
-                    const dpr = window.devicePixelRatio || 1;
-                    const titleHeight = 50 * dpr;
-                    const exportTitle = getExportChartTitle(key, dataset);
-                    const newCanvas = document.createElement('canvas');
-                    newCanvas.width = originalCanvas.width;
-                    newCanvas.height = originalCanvas.height + titleHeight;
-                    const ctx = newCanvas.getContext('2d');
-                    ctx.fillStyle = '#ffffff';
-                    ctx.fillRect(0, 0, newCanvas.width, newCanvas.height);
-                    ctx.fillStyle = '#000000';
-                    ctx.font = `bold ${24 * dpr}px Arial, sans-serif`;
-                    ctx.textAlign = 'center';
-                    ctx.textBaseline = 'middle';
-                    ctx.fillText(exportTitle, newCanvas.width / 2, titleHeight / 2);
-                    ctx.drawImage(originalCanvas, 0, titleHeight);
-                    const url = newCanvas.toDataURL('image/png');
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = `${dataset.name}.png`;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                });
-
-                let isPanning = false;
-                let panStartX = 0;
-                let panStartMin = 0;
-                let panStartMax = 0;
-
-                const onPanMove = (e) => {
-                    if (!isPanning) return;
-                    const rect = u.over.getBoundingClientRect();
-                    const cx = e.clientX - rect.left;
-                    const xRange = panStartMax - panStartMin;
-                    if (rect.width <= 0 || xRange === 0) return;
-                    const valAtStart = u.posToVal(panStartX, "x");
-                    const valAtNow = u.posToVal(cx, "x");
-                    const shift = valAtStart - valAtNow;
-                    let newMin = panStartMin + shift;
-                    let newMax = panStartMax + shift;
-                    const timeArr = plotData[0];
-                    if (timeArr && timeArr.length > 0) {
-                        const minTime = timeArr[0];
-                        const maxTime = timeArr[timeArr.length - 1];
-                        const totalDuration = maxTime - minTime;
-                        if (xRange >= totalDuration) {
-                            newMin = minTime;
-                            newMax = maxTime;
-                        } else {
-                            if (newMin < minTime) { newMin = minTime; newMax = newMin + xRange; }
-                            if (newMax > maxTime) { newMax = maxTime; newMin = newMax - xRange; }
-                        }
-                    }
-                    u.setScale("x", { min: newMin, max: newMax });
-                };
-
-                const endPan = () => {
-                    if (!isPanning) return;
-                    isPanning = false;
-                    window.removeEventListener("mousemove", onPanMove);
-                    window.removeEventListener("mouseup", endPan);
-                };
-
-                u.over.addEventListener("mousedown", (e) => {
-                    if (e.button !== 0) return; 
-                    e.preventDefault();
-                    const rect = u.over.getBoundingClientRect();
-                    const cx = e.clientX - rect.left;
-                    if (cx < 0 || cx > rect.width) return;
-                    const scaleX = u.scales.x;
-                    isPanning = true;
-                    panStartX = cx;
-                    panStartMin = scaleX.min;
-                    panStartMax = scaleX.max;
-                    window.addEventListener("mousemove", onPanMove);
-                    window.addEventListener("mouseup", endPan);
-                });
-                u.over.addEventListener("mouseleave", endPan);
-
-                chartDiv.addEventListener("wheel", e => {
-                    e.preventDefault();
-                    const rect = u.over.getBoundingClientRect();
-                    const cx = e.clientX - rect.left; 
-                    if (cx < 0 || cx > rect.width) return;
-                    const scaleX = u.scales.x;
-                    const xVal = u.posToVal(cx, "x");
-                    const xRange = scaleX.max - scaleX.min;
-                    const xMin = scaleX.min;
-                    const isZoomIn = e.deltaY < 0;
-                    const factor = isZoomIn ? 0.9 : 1.1; 
-                    const newRange = xRange * factor;
-                    const ratio = xRange === 0 ? 0 : (xVal - xMin) / xRange;
-                    let newMin = xVal - (ratio * newRange);
-                    let newMax = newMin + newRange;
-                    const timeArr = plotData[0];
-                    if (timeArr && timeArr.length > 0) {
-                        const minTime = timeArr[0];
-                        const maxTime = timeArr[timeArr.length - 1];
-                        const totalDuration = maxTime - minTime;
-                        if (newRange >= totalDuration) {
-                            newMin = minTime;
-                            newMax = maxTime;
-                        } else {
-                            if (newMin < minTime) { newMin = minTime; newMax = newMin + newRange; }
-                            if (newMax > maxTime) { newMax = maxTime; newMin = newMax - newRange; if(newMin < minTime) newMin = minTime;}
-                        }
-                    }
-                    u.batch(() => { u.setScale("x", { min: newMin, max: newMax }); });
-                });
+                initUplotTimeSeriesChart({ chartDiv, dataset, key, btnReset, btnSave });
             };
 
             chartObserver.observe(chartDiv);
         }
 
         if (trajSource && trajSource.data.PosX.length === trajSource.data.PosY.length && trajSource.data.PosX.length > 0) {
-            const wrapper = document.createElement('div');
-            wrapper.className = 'chart-wrapper';
-            
-            const headerDiv = document.createElement('div');
-            headerDiv.style.display = 'flex';
-            headerDiv.style.justifyContent = 'center';
-            headerDiv.style.alignItems = 'center';
-            headerDiv.style.marginBottom = '10px';
-            headerDiv.style.position = 'relative';
-
-            const leftToolVals = document.createElement('div');
-            leftToolVals.style.display = 'flex';
-            leftToolVals.style.alignItems = 'center';
-            leftToolVals.style.justifyContent = 'center';
-            leftToolVals.style.width = '100%';
-            leftToolVals.style.position = 'relative';
-            const btnCollapse = document.createElement('button');
-            btnCollapse.innerText = '▼';
-            btnCollapse.className = 'btn-tool btn-collapse';
-            btnCollapse.style.position = 'absolute';
-            btnCollapse.style.left = '0';
-            btnCollapse.style.marginRight = '0';
-            btnCollapse.title = tr('Collapse/Expand chart', 'Collapse/Expand chart');
-            leftToolVals.appendChild(btnCollapse);
-
-            const headerTitle = document.createElement('span');
-            headerTitle.innerText = getChartName('FlightTrajectory_3D', 'FlightTrajectory_3D');
-            headerTitle.style.fontWeight = 'bold';
-            headerTitle.style.display = 'inline'; 
-            leftToolVals.appendChild(headerTitle);
-
-            headerDiv.appendChild(leftToolVals);
-            wrapper.appendChild(headerDiv);
-
-            const chartDiv = document.createElement('div');
-            chartDiv.style.width = '100%';
-            chartDiv.style.height = '600px';
-            chartDiv.style.transition = 'height 0.3s ease, min-height 0.3s ease, opacity 0.3s ease';
-            wrapper.appendChild(chartDiv);
-            chartsContainer.appendChild(wrapper);
-            trajectoryWrapper = wrapper;
-
-            const trajHelpBtn = createHelpButton(
-                () => getChartName('FlightTrajectory_3D', 'FlightTrajectory_3D'),
-                () => getHelpTextByContext({ kind: 'chart', key: 'FlightTrajectory_3D', dataset: null })
-            );
-            setHelpButtonPlacement(trajHelpBtn, wrapper, headerDiv, false);
-
-            let isCollapsed = false;
-            btnCollapse.addEventListener('click', () => {
-                isCollapsed = !isCollapsed;
-                if (isCollapsed) {
-                    btnCollapse.innerText = '▶';
-                    chartDiv.style.height = '0px';
-                    chartDiv.style.minHeight = '0px';
-                    chartDiv.style.overflow = 'hidden';
-                    chartDiv.style.opacity = '0';
-                    leftToolVals.style.justifyContent = 'flex-start';
-                    headerTitle.style.textAlign = 'left';
-                    headerTitle.style.paddingLeft = '44px';
-                } else {
-                    btnCollapse.innerText = '▼';
-                    chartDiv.style.height = '600px'; 
-                    chartDiv.style.minHeight = '';
-                    chartDiv.style.overflow = '';
-                    chartDiv.style.opacity = '1';
-                    leftToolVals.style.justifyContent = 'center';
-                    headerTitle.style.textAlign = 'center';
-                    headerTitle.style.paddingLeft = '0';
-                }
-                setHelpButtonPlacement(trajHelpBtn, wrapper, headerDiv, isCollapsed);
-            });
-
-            const timeArr = trajSource.data.Time;
-            const posY = trajSource.data.PosY;
-            const posX = trajSource.data.PosX;
-            const posZ = trajSource.data.PosZ || [];
-            
-            const totalPoints = timeArr.length;
-            const MAX_3D_POINTS = 50000;
-            const step = Math.ceil(totalPoints / MAX_3D_POINTS); 
-            
-            const segments = [];
-            let currentSeg = { x: [], y: [], z: [] };
-            const GAP_THRESHOLD = 1.0; 
-
-            for (let i = 0; i < totalPoints; i += step) {
-                if (i > 0) {
-                    const prevI = i - step >= 0 ? i - step : i - 1;
-                    const dt = timeArr[i] - timeArr[prevI];
-                    if (dt > GAP_THRESHOLD * Math.max(1, step * 0.5)) { 
-                        if (currentSeg.x.length > 0) segments.push(currentSeg);
-                        currentSeg = { x: [], y: [], z: [] };
-                    }
-                }
-                currentSeg.x.push(-posY[i]);
-                currentSeg.y.push(posX[i]);
-                currentSeg.z.push(posZ.length > i ? -posZ[i] : 0);
-            }
-            if (currentSeg.x.length > 0) segments.push(currentSeg);
-
-            let minX = Infinity, maxX = -Infinity;
-            let minY = Infinity, maxY = -Infinity;
-            let minZ = Infinity, maxZ = -Infinity;
-            
-            segments.forEach(seg => {
-                seg.x.forEach(v => {
-                    if (v < minX) minX = v;
-                    if (v > maxX) maxX = v;
-                });
-                seg.y.forEach(v => {
-                    if (v < minY) minY = v;
-                    if (v > maxY) maxY = v;
-                });
-                seg.z.forEach(v => {
-                    if (v < minZ) minZ = v;
-                    if (v > maxZ) maxZ = v;
-                });
-            });
-            
-            if (minX === Infinity) { minX = -1; maxX = 1; }
-            if (minY === Infinity) { minY = -1; maxY = 1; }
-            if (minZ === Infinity) { minZ = -1; maxZ = 1; }
-
-            const segColors = [
-                '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', 
-                '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf'
-            ];
-
-            const traces = [];
-
-            segments.forEach((seg, idx) => {
-                const color = segColors[idx % segColors.length];
-                const groupName = `group_${idx}`;
-                const segmentName = `Segment ${idx + 1}`;
-
-                traces.push({
-                    x: seg.x,
-                    y: seg.y,
-                    z: seg.z,
-                    mode: 'lines',
-                    type: 'scatter3d',
-                    line: { width: 4, color: color },
-                    name: segmentName,
-                    legendgroup: groupName,
-                    showlegend: true,
-                    hoverinfo: 'x+y+z+name'
-                });
-
-                if (seg.x.length > 0) {
-                    traces.push({
-                        x: [seg.x[0]],
-                        y: [seg.y[0]],
-                        z: [seg.z[0]],
-                        mode: 'markers',
-                        type: 'scatter3d',
-                        marker: { size: 5, color: '#00cc00', symbol: 'circle' },
-                        name: `${segmentName} Start`,
-                        legendgroup: groupName,
-                        showlegend: false,
-                        hoverinfo: 'x+y+z+name'
-                    });
-
-                    const last = seg.x.length - 1;
-                    traces.push({
-                        x: [seg.x[last]],
-                        y: [seg.y[last]],
-                        z: [seg.z[last]],
-                        mode: 'markers',
-                        type: 'scatter3d',
-                        marker: { size: 5, color: '#cc0000', symbol: 'circle' },
-                        name: `${segmentName} End`,
-                        legendgroup: groupName,
-                        showlegend: false,
-                        hoverinfo: 'x+y+z+name'
-                    });
-                }
-            });
-
-            const layout = {
-                margin: { l: 0, r: 0, b: 0, t: 40 },
-                showlegend: segments.length > 1, 
-                scene: {
-                    xaxis: { title: 'X' },
-                    yaxis: { title: 'Y' },
-                    zaxis: { title: 'Z' },
-                    aspectmode: 'data'
-                }
-            };
-            Plotly.newPlot(chartDiv, traces, layout, { displaylogo: false, responsive: true });
+            trajectoryWrapper = renderTrajectory3DChart({ trajSource });
         }
 
         if (data.datasets['IMU_Spectrogram']) {
             const specData = data.datasets['IMU_Spectrogram'];
-            
-            const wrapper = document.createElement('div');
-            wrapper.className = 'chart-wrapper';
-            
-            const headerDiv = document.createElement('div');
-            headerDiv.style.display = 'flex';
-            headerDiv.style.justifyContent = 'center';
-            headerDiv.style.alignItems = 'center';
-            headerDiv.style.marginBottom = '10px';
-
-            const leftToolVals = document.createElement('div');
-            leftToolVals.style.display = 'flex';
-            leftToolVals.style.alignItems = 'center';
-            leftToolVals.style.justifyContent = 'center';
-            leftToolVals.style.width = '100%';
-            leftToolVals.style.position = 'relative';
-            const btnCollapse = document.createElement('button');
-            btnCollapse.innerText = '▼';
-            btnCollapse.className = 'btn-tool btn-collapse';
-            btnCollapse.style.position = 'absolute';
-            btnCollapse.style.left = '0';
-            btnCollapse.style.marginRight = '0';
-            leftToolVals.appendChild(btnCollapse);
-
-            const headerTitle = document.createElement('span');
-            const tMap = (typeof ChartTranslations !== 'undefined') ? ChartTranslations : {};
-            const translatedName = tMap['IMU_Spectrogram'] || specData.name;
-            headerTitle.innerText = translatedName;
-            
-            headerTitle.style.fontWeight = 'bold';
-            headerTitle.style.display = 'inline'; 
-            leftToolVals.appendChild(headerTitle);
-
-            headerDiv.appendChild(leftToolVals);
-            wrapper.appendChild(headerDiv);
-
-            const chartDiv = document.createElement('div');
-            chartDiv.style.width = '100%';
-            chartDiv.style.height = '500px'; 
-            chartDiv.style.transition = 'height 0.3s ease, min-height 0.3s ease, opacity 0.3s ease';
-            wrapper.appendChild(chartDiv);
-            if (firstSensorPanelWrapper && firstSensorPanelWrapper.parentNode === chartsContainer) {
-                chartsContainer.insertBefore(wrapper, firstSensorPanelWrapper);
-            } else if (trajectoryWrapper && trajectoryWrapper.parentNode === chartsContainer) {
-                chartsContainer.insertBefore(wrapper, trajectoryWrapper);
-            } else {
-                chartsContainer.appendChild(wrapper);
-            }
-
-            const specHelpBtn = createHelpButton(
-                () => translatedName,
-                () => getHelpTextByContext({ kind: 'chart', key: 'IMU_Spectrogram', dataset: specData })
-            );
-            setHelpButtonPlacement(specHelpBtn, wrapper, headerDiv, false);
-
-            let isCollapsed = false;
-            btnCollapse.addEventListener('click', () => {
-                isCollapsed = !isCollapsed;
-                if (isCollapsed) {
-                    btnCollapse.innerText = '▶';
-                    chartDiv.style.height = '0px';
-                    chartDiv.style.minHeight = '0px';
-                    chartDiv.style.overflow = 'hidden';
-                    chartDiv.style.opacity = '0';
-                    leftToolVals.style.justifyContent = 'flex-start';
-                    headerTitle.style.textAlign = 'left';
-                    headerTitle.style.paddingLeft = '44px';
-                } else {
-                    btnCollapse.innerText = '▼';
-                    chartDiv.style.height = '500px'; 
-                    chartDiv.style.minHeight = '';
-                    chartDiv.style.overflow = '';
-                    chartDiv.style.opacity = '1';
-                    leftToolVals.style.justifyContent = 'center';
-                    headerTitle.style.textAlign = 'center';
-                    headerTitle.style.paddingLeft = '0';
-                    if (chartDiv.layout) Plotly.relayout(chartDiv, { 'xaxis.autorange': true, 'yaxis.autorange': true });
-                }
-                setHelpButtonPlacement(specHelpBtn, wrapper, headerDiv, isCollapsed);
+            renderSpectrogramChart({
+                specData,
+                firstSensorPanelWrapperRef: firstSensorPanelWrapper,
+                trajectoryWrapperRef: trajectoryWrapper
             });
-
-            // Optimize: Pre-render heatmap to multiple image canvases (Slicing Strategy)
-            // 解决超长日志导致 Canvas 宽度溢出（崩溃/黑屏）的问题
-            // 将整个频谱图切分为多个宽度适中（如 4096px）的小图片并排显示
-            const rawWidth = specData.data.x.length;
-            const rawHeight = specData.data.y.length;
-            const zValues = specData.data.z; // Row: Freq, Col: Time
-            
-            // Dynamic Range
-            const zMax = specData.maxDB || 0;
-            const zMin = zMax - 60; // 60dB range
-
-            // Helper: Jet Colormap
-            function getJetColor(v) {
-                let r=0, g=0, b=0;
-                if (v < 0) v = 0; if (v > 1) v = 1;
-                
-                if (v < 0.125) { r=0; g=0; b=0.5 + 4*v; } // 0..0.5
-                else if (v < 0.375) { r=0; g=4*(v-0.125); b=1; }
-                else if (v < 0.625) { r=4*(v-0.375); g=1; b=1 - 4*(v-0.375); }
-                else if (v < 0.875) { r=1; g=1 - 4*(v-0.625); b=0; }
-                else { r=1 - 4*(v-0.875); g=0; b=0; } // 0.5..0
-                
-                return [Math.floor(r*255), Math.floor(g*255), Math.floor(b*255)];
-            }
-
-            // Calculate DT (Time per pixel)
-            const xAll = specData.data.x;
-            const dt = (rawWidth > 1) ? (xAll[rawWidth-1] - xAll[0]) / (rawWidth - 1) : 1;
-
-            const MAX_SLICE_WIDTH = 4096; // 限制每个 Canvas 的最大宽度
-            const imagesList = [];
-
-            const yTop = specData.data.y[rawHeight - 1]; // Max Freq
-            const yHeight = yTop - specData.data.y[0];   // Freq Range
-
-            for (let startCol = 0; startCol < rawWidth; startCol += MAX_SLICE_WIDTH) {
-                const sliceWidth = Math.min(MAX_SLICE_WIDTH, rawWidth - startCol);
-                
-                // Create Slice Canvas
-                const sliceCanvas = document.createElement('canvas');
-                sliceCanvas.width = sliceWidth;
-                sliceCanvas.height = rawHeight;
-                const sliceCtx = sliceCanvas.getContext('2d');
-                const imgData = sliceCtx.createImageData(sliceWidth, rawHeight);
-
-                // Fill Pixels
-                for (let f = 0; f < rawHeight; f++) {
-                    const imgRow = rawHeight - 1 - f; // Flip Y (Canvas 0 is Top)
-                    const rowData = zValues[f];
-                    
-                    for (let t = 0; t < sliceWidth; t++) {
-                        const globalT = startCol + t;
-                        const db = rowData[globalT];
-                         
-                        const norm = (db - zMin) / (zMax - zMin);
-                        const [r, g, b] = getJetColor(norm);
-                        
-                        const idx = (imgRow * sliceWidth + t) * 4;
-                        imgData.data[idx] = r;
-                        imgData.data[idx+1] = g;
-                        imgData.data[idx+2] = b;
-                        imgData.data[idx+3] = 255;
-                    }
-                }
-                sliceCtx.putImageData(imgData, 0, 0);
-
-                // Add to Plotly Images
-                const xPos = xAll[startCol];
-                const endIdx = startCol + sliceWidth - 1;
-                let duration = xAll[endIdx] - xPos;
-                if (duration <= 0) duration = sliceWidth * dt;
-
-                imagesList.push({
-                    source: sliceCanvas.toDataURL(),
-                    xref: 'x',
-                    yref: 'y',
-                    x: xPos,
-                    y: yTop,
-                    sizex: duration,
-                    sizey: yHeight,
-                    sizing: 'stretch',
-                    layer: 'below'
-                });
-            }
-
-            // Setup Axes Range
-            const xStart = xAll[0];
-            const xEnd = xAll[rawWidth - 1];
-            const yStart = specData.data.y[0];
-            const yEnd = yTop;
-
-            // Use a dummy trace for Colorbar
-            const dummyTrace = {
-                x: [xStart, xEnd],
-                y: [yStart, yEnd],
-                z: [[zMin, zMin], [zMax, zMax]], 
-                type: 'heatmap',
-                colorscale: 'Jet',
-                showscale: true,
-                colorbar: { title: 'Log Power (dB)' },
-                opacity: 0, 
-                hoverinfo: 'none'
-            };
-
-            const layout = {
-                margin: { l: 60, r: 20, b: 50, t: 40 },
-                xaxis: { 
-                    title: 'Time (s)', 
-                    range: [xStart, xEnd],
-                    constrain: 'domain'
-                },
-                yaxis: { 
-                    title: 'Frequency (Hz)',
-                    range: [yStart, yEnd],
-                },
-                dragmode: 'pan',
-                // Pass all slices
-                images: imagesList
-            };
-
-            Plotly.newPlot(chartDiv, [dummyTrace], layout, { displaylogo: false, responsive: true, scrollZoom: true })
-                .then(() => {
-                    const imgs = chartDiv.querySelectorAll('image');
-                    imgs.forEach((img) => {
-                        img.style.imageRendering = 'pixelated';
-                        img.setAttribute('image-rendering', 'pixelated');
-                        img.setAttribute('shape-rendering', 'crispEdges');
-                    });
-
-                    // Clamp pan/zoom to data bounds (same behavior as other charts)
-                    const clampRange = (min, max, lo, hi) => {
-                        let span = max - min;
-                        const full = hi - lo;
-                        if (span <= 0) return { min: lo, max: hi };
-                        if (span >= full) return { min: lo, max: hi };
-                        if (min < lo) { min = lo; max = lo + span; }
-                        if (max > hi) { max = hi; min = hi - span; }
-                        return { min, max };
-                    };
-
-                    let isClamping = false;
-                    const clampAxes = (evt) => {
-                        if (isClamping || !evt) return;
-                        const xr0 = evt['xaxis.range[0]'];
-                        const xr1 = evt['xaxis.range[1]'];
-                        const yr0 = evt['yaxis.range[0]'];
-                        const yr1 = evt['yaxis.range[1]'];
-
-                        const updates = {};
-
-                        if (typeof xr0 === 'number' && typeof xr1 === 'number') {
-                            const clamped = clampRange(xr0, xr1, xStart, xEnd);
-                            if (clamped.min !== xr0 || clamped.max !== xr1) {
-                                updates['xaxis.range'] = [clamped.min, clamped.max];
-                            }
-                        }
-
-                        if (typeof yr0 === 'number' && typeof yr1 === 'number') {
-                            const clamped = clampRange(yr0, yr1, yStart, yEnd);
-                            if (clamped.min !== yr0 || clamped.max !== yr1) {
-                                updates['yaxis.range'] = [clamped.min, clamped.max];
-                            }
-                        }
-
-                        if (Object.keys(updates).length > 0) {
-                            isClamping = true;
-                            Plotly.relayout(chartDiv, updates).then(() => { isClamping = false; });
-                        }
-                    };
-
-                    chartDiv.on('plotly_relayouting', clampAxes);
-                    chartDiv.on('plotly_relayout', clampAxes);
-                });
         }
     }
 });

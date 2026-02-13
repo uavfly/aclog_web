@@ -22,6 +22,7 @@ const ChartTranslations = {
     "Your IP": "您的 IP",
     "Please upload a .aclog file": "请上传 .aclog 格式的日志文件",
     "Reading file...": "正在读取文件...",
+    "Loading from memory cache...": "正在从内存缓存加载...",
     "Parsing data...": "正在解析数据...",
     "Parse Error": "解析出错",
     "Header Parse Failed": "头解析失败",
